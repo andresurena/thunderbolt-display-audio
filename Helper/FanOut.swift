@@ -46,10 +46,15 @@ final class FanOut {
     private var identifyPosition: Int32 = 0
     private var tonePhase: Float = 0
 
-    init(virtualDevice: DeviceInfo, displays: [DeviceInfo], modes: [ChannelMode], listenerQueue: DispatchQueue) {
+    // Balance gains (left speaker, right speaker), written from the control thread.
+    private var gainLeft: Float = 1
+    private var gainRight: Float = 1
+
+    init(virtualDevice: DeviceInfo, displays: [DeviceInfo], modes: [ChannelMode], balance: Float, listenerQueue: DispatchQueue) {
         self.virtualDevice = virtualDevice
         self.displays = Array(displays.prefix(FanOut.maxDisplays))
         self.listenerQueue = listenerQueue
+        setBalance(balance)
         outputBufferDisplay.initialize(repeating: -1, count: FanOut.maxOutputBuffers)
         modeTable.initialize(repeating: ChannelMode.stereo.rawValue, count: FanOut.maxDisplays)
         for (index, mode) in modes.prefix(FanOut.maxDisplays).enumerated() { modeTable[index] = mode.rawValue }
@@ -103,6 +108,7 @@ final class FanOut {
             throw FanOutError.message("Aggregate has no stereo input stream (input layout \(inputLayout))")
         }
         sourceBufferIndex = sourceIndex
+        deactivateUnusedInputStreams(of: id, keeping: sourceIndex)
 
         // Map output buffers to displays in sub-device order: virtual streams first, then each display's.
         var bufferIndex = virtualDevice.id.streamChannels(scope: kAudioObjectPropertyScopeOutput).count
@@ -154,6 +160,17 @@ final class FanOut {
         aggregateID != kAudioObjectUnknown && aggregateID.isAlive && aggregateID.isRunning
     }
 
+    /// The displays also carry a microphone each. The helper never uses them, so switch those
+    /// streams off in the aggregate: only the virtual device's loopback stream stays active.
+    private func deactivateUnusedInputStreams(of aggregate: AudioObjectID, keeping sourceIndex: Int) {
+        let streams = aggregate.audioObjectIDs(address(kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeInput))
+        for (index, stream) in streams.enumerated() where index != sourceIndex {
+            let status = stream.setAudioValue(address(kAudioStreamPropertyIsActive), UInt32(0))
+            if status != noErr { log("Could not deactivate input stream \(index): \(status)") }
+        }
+        if streams.count > 1 { log("Deactivated \(streams.count - 1) microphone stream(s) in the aggregate") }
+    }
+
     // MARK: Routing controls (any thread; the IO thread picks the values up on its next cycle)
 
     func setMode(_ mode: ChannelMode, forDisplayAt index: Int) {
@@ -164,6 +181,14 @@ final class FanOut {
     func mode(forDisplayAt index: Int) -> ChannelMode {
         guard index >= 0, index < displays.count else { return .stereo }
         return ChannelMode(rawValue: modeTable[index]) ?? .stereo
+    }
+
+    /// -1 = fully left, 0 = centre, 1 = fully right. Like the classic macOS slider: the side you move
+    /// toward stays at full level and the other side is attenuated linearly down to silence.
+    func setBalance(_ balance: Float) {
+        let clamped = max(-1, min(1, balance))
+        gainLeft = clamped > 0 ? 1 - clamped : 1
+        gainRight = clamped < 0 ? 1 + clamped : 1
     }
 
     /// Three short beeps through one display only, so the user can tell which screen is which.
@@ -218,27 +243,33 @@ final class FanOut {
 
             let mode = modeTable[Int(displayIndex)]
             let frames = min(sourceFrames, destFrames)
+            let left = gainLeft, right = gainRight
 
-            if mode == ChannelMode.stereo.rawValue, destChannels == sourceChannels, buffer.mDataByteSize == source.mDataByteSize {
+            if mode == ChannelMode.stereo.rawValue, left == 1, right == 1,
+               destChannels == sourceChannels, buffer.mDataByteSize == source.mDataByteSize {
                 memcpy(destData, sourceData, Int(buffer.mDataByteSize))
                 continue
             }
 
+            // A display playing one channel sits on that side, so the whole display takes that side's
+            // gain. Otherwise the display's own left/right speakers (channel 0/1) take the gains.
             for frame in 0..<frames {
                 let base = frame * sourceChannels
                 switch mode {
                 case ChannelMode.leftOnly.rawValue:
-                    let value = src[base]
+                    let value = src[base] * left
                     for channel in 0..<destChannels { dst[frame * destChannels + channel] = value }
                 case ChannelMode.rightOnly.rawValue:
-                    let value = src[base + rightOffset]
+                    let value = src[base + rightOffset] * right
                     for channel in 0..<destChannels { dst[frame * destChannels + channel] = value }
                 case ChannelMode.mono.rawValue:
                     let value = 0.5 * (src[base] + src[base + rightOffset])
-                    for channel in 0..<destChannels { dst[frame * destChannels + channel] = value }
+                    for channel in 0..<destChannels {
+                        dst[frame * destChannels + channel] = value * (channel % 2 == 0 ? left : right)
+                    }
                 default:
                     for channel in 0..<destChannels {
-                        dst[frame * destChannels + channel] = src[base + channel % sourceChannels]
+                        dst[frame * destChannels + channel] = src[base + channel % sourceChannels] * (channel % 2 == 0 ? left : right)
                     }
                 }
             }

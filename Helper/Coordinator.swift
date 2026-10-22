@@ -12,7 +12,10 @@ struct DisplaySummary {
 struct Snapshot {
     let status: String
     let displays: [DisplaySummary]
+    let balance: Float
 }
+
+private let balanceKey = "balance"
 
 /// Watches the device list and keeps one FanOut alive for the current set of displays.
 final class Coordinator {
@@ -23,6 +26,7 @@ final class Coordinator {
     private var healthTimer: DispatchSourceTimer?
 
     private var status = "Starting…"
+    private var balance = Float(UserDefaults.standard.double(forKey: balanceKey))
     private var signalWasFlowing = false
     private var displayCount = 0
 
@@ -64,7 +68,7 @@ final class Coordinator {
                 DisplaySummary(index: index, uid: device.uid, label: device.label,
                                mode: fanOut?.mode(forDisplayAt: index) ?? .stereo)
             }
-            return Snapshot(status: status, displays: displays)
+            return Snapshot(status: status, displays: displays, balance: balance)
         }
     }
 
@@ -107,6 +111,21 @@ final class Coordinator {
             }
             log("Routing: stereo on every display")
         }
+    }
+
+    func setBalance(_ value: Float) {
+        queue.async {
+            self.balance = max(-1, min(1, value))
+            UserDefaults.standard.set(Double(self.balance), forKey: balanceKey)
+            self.fanOut?.setBalance(self.balance)
+            log("Balance: \(Coordinator.describeBalance(self.balance))")
+        }
+    }
+
+    static func describeBalance(_ value: Float) -> String {
+        let percent = Int((abs(value) * 100).rounded())
+        if percent == 0 { return "centre" }
+        return value < 0 ? "\(percent)% left" : "\(percent)% right"
     }
 
     func identify(displayUID uid: String) {
@@ -178,12 +197,12 @@ final class Coordinator {
         }
 
         let modes = displays.map { ChannelMode.load(for: $0.uid) }
-        let candidate = FanOut(virtualDevice: virtualDevice, displays: displays, modes: modes, listenerQueue: queue)
+        let candidate = FanOut(virtualDevice: virtualDevice, displays: displays, modes: modes, balance: balance, listenerQueue: queue)
         do {
             try candidate.start()
             fanOut = candidate
             let routing = zip(displays, modes).map { "\($0.label) [\($0.id)] -> \($1.shortTitle)" }.joined(separator: ", ")
-            log("Playing \"\(virtualDevice.name)\" through \(routing)")
+            log("Playing \"\(virtualDevice.name)\" through \(routing); balance \(Coordinator.describeBalance(balance))")
             displayCount = displays.count
             signalWasFlowing = false
             status = playingStatus()

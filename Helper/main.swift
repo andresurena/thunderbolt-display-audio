@@ -1,6 +1,52 @@
 import AppKit
 
+/// Menu row holding the left/right balance slider.
+final class BalanceView: NSView {
+    let slider = NSSlider(value: 0, minValue: -1, maxValue: 1, target: nil, action: nil)
+    let valueLabel = NSTextField(labelWithString: "")
+
+    init(balance: Float, target: AnyObject, action: Selector) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 260, height: 52))
+        let title = NSTextField(labelWithString: "Balance")
+        title.font = NSFont.menuFont(ofSize: 0)
+        title.frame = NSRect(x: 14, y: 30, width: 80, height: 17)
+        addSubview(title)
+
+        valueLabel.font = NSFont.menuFont(ofSize: 0)
+        valueLabel.textColor = .secondaryLabelColor
+        valueLabel.alignment = .right
+        valueLabel.frame = NSRect(x: 140, y: 30, width: 106, height: 17)
+        addSubview(valueLabel)
+
+        let left = NSTextField(labelWithString: "L")
+        left.font = NSFont.menuFont(ofSize: 0)
+        left.frame = NSRect(x: 14, y: 6, width: 14, height: 17)
+        addSubview(left)
+        let right = NSTextField(labelWithString: "R")
+        right.font = NSFont.menuFont(ofSize: 0)
+        right.frame = NSRect(x: 234, y: 6, width: 14, height: 17)
+        addSubview(right)
+
+        slider.frame = NSRect(x: 30, y: 4, width: 200, height: 22)
+        slider.numberOfTickMarks = 3
+        slider.allowsTickMarkValuesOnly = false
+        slider.isContinuous = true
+        slider.floatValue = balance
+        slider.target = target
+        slider.action = action
+        addSubview(slider)
+        update(balance)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func update(_ balance: Float) {
+        valueLabel.stringValue = Coordinator.describeBalance(balance).capitalized
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private var balanceView: BalanceView?
     private var statusItem: NSStatusItem?
     private let coordinator = Coordinator()
     private let menu = NSMenu()
@@ -49,6 +95,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(stereo)
             }
             menu.addItem(.separator())
+
+            let balanceItem = NSMenuItem(title: "Balance", action: nil, keyEquivalent: "")
+            let view = BalanceView(balance: snapshot.balance, target: self, action: #selector(balanceChanged(_:)))
+            balanceItem.view = view
+            balanceView = view
+            menu.addItem(balanceItem)
+            let centre = action("Centre Balance", #selector(centreBalance))
+            centre.isEnabled = snapshot.balance != 0
+            menu.addItem(centre)
+            menu.addItem(.separator())
         }
 
         menu.addItem(action("Rebuild Audio Routing", #selector(rebuild), key: "r"))
@@ -89,6 +145,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let uid = sender.representedObject as? String else { return }
         coordinator.identify(displayUID: uid)
     }
+
+    @objc private func balanceChanged(_ sender: NSSlider) {
+        var value = sender.floatValue
+        if abs(value) < 0.04 { value = 0; sender.floatValue = 0 }   // snap to centre
+        balanceView?.update(value)
+        coordinator.setBalance(value)
+    }
+
+    @objc private func centreBalance() { coordinator.setBalance(0) }
 
     @objc private func swapOrSplit() { coordinator.swapOrSplitLeftRight() }
     @objc private func setAllStereo() { coordinator.setAllStereo() }

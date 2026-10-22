@@ -51,6 +51,13 @@ Click the menu bar icon. Each display has a submenu:
 "Swap Left and Right" once a split is active. Choices are stored per display UID in the helper's
 preferences and survive restarts and replugging. Switching takes effect immediately.
 
+## Balance
+
+The menu has a left/right balance slider (macOS no longer shows one for most devices). It behaves
+like the classic control: the side you move toward stays at full level, the other side is attenuated
+linearly to silence. In stereo mode it acts on each display's own left/right speakers; in a
+left/right split it acts on the two displays. The value persists.
+
 ## Notes
 
 * The virtual device runs at 48 kHz; the helper switches both displays to 48 kHz.
@@ -58,6 +65,9 @@ preferences and survive restarts and replugging. Switching takes effect immediat
 * The aggregate also carries the virtual device's own output stream; the helper writes silence to
   it (never the audio), otherwise the loopback would echo forever.
 * The menu bar status shows "audio flowing" / "silent"; the log records "Signal detected" / "Signal stopped".
+* macOS shows the orange microphone indicator while the helper runs: reading the loopback input
+  counts as audio input, even though the helper deactivates the displays' real microphone streams
+  in its aggregate and never touches them. Same behaviour as Background Music, eqMac and Loopback.
 * "Thunderbolt Displays" also appears as an *input* device. That is the loopback the helper reads;
   ignore it (or pick it in another app to record system audio, like BlackHole).
 * Log: `~/Library/Logs/ThunderboltDisplays.log`. Menu bar: Rebuild Audio Routing, Show Log, Quit.
