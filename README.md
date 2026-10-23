@@ -36,9 +36,11 @@ scripts/make-icon.sh  # regenerates Helper/AppIcon.icns from Tools/MakeIcon.swif
 
 No password is needed on an admin account. The install waits for launchd to finish unloading the
 previous copy before loading the new one and fails loudly if the app does not start. Quit from the
-menu stops the app until next login; it is only restarted automatically after a crash. If macOS asks whether "Thunderbolt Displays Helper" may record system
-audio, click Allow. Then choose either "Display Audio" in the Sound menu, or click
-"Use Thunderbolt Displays as Output" in the helper's menu.
+menu stops the app until next login; it is only restarted automatically after a crash.
+
+If macOS asks whether "Thunderbolt Displays Audio" may record system audio, click Allow. Then
+choose either "Display Audio" in the Sound menu, or click "Use Thunderbolt Displays as Output" in
+the app's menu.
 
 Upgrading from the first, plugin-based version: `scripts/remove-legacy-plugin.sh` removes the old
 "Thunderbolt Displays" virtual device (needs your password, restarts coreaudiod).
