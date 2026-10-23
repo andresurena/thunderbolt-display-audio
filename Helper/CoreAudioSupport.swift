@@ -20,9 +20,23 @@ private let timestampFormatter: DateFormatter = {
     return formatter
 }()
 
+/// Appends to ~/Library/Logs/ThunderboltDisplays.log, whether the app was started by the install
+/// script's LaunchAgent, as a login item, or by double-clicking it.
+private let logQueue = DispatchQueue(label: "com.andresurena.ThunderboltDisplays.log")
+private let logHandle: FileHandle? = {
+    let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/ThunderboltDisplays.log")
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil) }
+    let handle = try? FileHandle(forWritingTo: url)
+    _ = try? handle?.seekToEnd()
+    return handle
+}()
+
 func log(_ message: String) {
     let line = "\(timestampFormatter.string(from: Date())) \(message)\n"
-    FileHandle.standardError.write(Data(line.utf8))
+    logQueue.async {
+        if let handle = logHandle { handle.write(Data(line.utf8)) } else { FileHandle.standardError.write(Data(line.utf8)) }
+    }
 }
 
 func fourCharCode(_ value: UInt32) -> String {
@@ -196,7 +210,7 @@ enum ChannelMode: Int32, CaseIterable {
 }
 
 extension DeviceInfo {
-    /// "Display Audio 172A16C9": the serial fragment from the USB UID tells two identical displays apart.
+    /// "Display Audio 1A2B3C4D": the serial fragment from the USB UID tells two identical displays apart.
     var label: String {
         let parts = uid.split(separator: ":")
         if parts.count >= 4, parts[2] == Substring(name) { return "\(name) \(parts[3])" }
@@ -205,7 +219,7 @@ extension DeviceInfo {
 }
 
 extension DeviceInfo {
-    /// USB serial from the UID ("...:Display Audio:181512A7:2,1" -> "181512A7"); matches the screen's serial.
+    /// USB serial from the UID ("...:Display Audio:1A2B3C4D:2,1" -> "1A2B3C4D"); matches the screen's serial.
     var serial: String {
         let parts = uid.split(separator: ":")
         return parts.count >= 4 ? String(parts[3]) : uid

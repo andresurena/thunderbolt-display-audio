@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 
 /// Menu row holding the left/right balance slider.
 final class BalanceView: NSView {
@@ -139,8 +140,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(action("Rebuild Audio Routing", #selector(rebuild), key: "r"))
         menu.addItem(action("Open Sound Settings", #selector(openSoundSettings)))
         menu.addItem(action("Show Log", #selector(showLog)))
+        menu.addItem(loginItem())
         menu.addItem(.separator())
-        menu.addItem(action("Quit Thunderbolt Displays Helper", #selector(quit), key: "q"))
+        menu.addItem(action("Quit Thunderbolt Displays Audio", #selector(quit), key: "q"))
     }
 
     private func submenu(for display: DisplaySummary, active: Bool) -> NSMenu {
@@ -281,6 +283,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
+
+    // MARK: Open at Login
+
+    /// The install script starts the app with its own LaunchAgent; a downloaded copy uses the
+    /// system's login item list instead. Never both, so the app cannot run twice.
+    private var installedByScript: Bool {
+        FileManager.default.fileExists(atPath: FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/com.andresurena.ThunderboltDisplays.helper.plist").path)
+    }
+
+    private func loginItem() -> NSMenuItem {
+        if installedByScript {
+            let item = NSMenuItem(title: "Opens at Login (set up by the install script)", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            item.state = .on
+            return item
+        }
+        let item = action("Open at Login", #selector(toggleLogin))
+        item.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        return item
+    }
+
+    @objc private func toggleLogin() {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+                log("Open at Login: off")
+            } else {
+                try SMAppService.mainApp.register()
+                log("Open at Login: on")
+            }
+        } catch {
+            log("Open at Login change failed: \(error)")
+            let alert = NSAlert()
+            alert.messageText = "Couldn't change Open at Login"
+            alert.informativeText = "\(error.localizedDescription)\n\nYou can add the app in System Settings › General › Login Items."
+            alert.runModal()
+        }
+    }
+}
+
+// Only one copy may run: two would each build their own tap and fight over the displays.
+let myPID = ProcessInfo.processInfo.processIdentifier
+if NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+    .contains(where: { $0.processIdentifier != myPID }) {
+    log("Another copy is already running; exiting")
+    Thread.sleep(forTimeInterval: 0.2)   // let the log line flush
+    exit(0)
 }
 
 let app = NSApplication.shared
@@ -294,5 +344,5 @@ let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
 termSource.setEventHandler { NSApp.terminate(nil) }
 termSource.resume()
 
-log("Thunderbolt Displays Helper starting")
+log("Thunderbolt Displays Audio starting (version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] ?? "?"))")
 app.run()

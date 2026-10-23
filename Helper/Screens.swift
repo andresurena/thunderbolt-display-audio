@@ -4,7 +4,7 @@ import CoreGraphics
 // MARK: - Matching audio devices to screens
 
 /// An Apple Thunderbolt Display reports the same serial to CoreGraphics (CGDisplaySerialNumber) as its
-/// "Display Audio" USB device carries in its UID, e.g. "...:Display Audio:181512A7:2,1" <-> 0x181512A7.
+/// "Display Audio" USB device carries in its UID, e.g. "...:Display Audio:1A2B3C4D:2,1" <-> 0x1A2B3C4D.
 enum ScreenMatch {
     /// CoreGraphics display ID of the screen whose serial matches, if that screen is active.
     static func displayID(forSerial serial: String) -> CGDirectDisplayID? {

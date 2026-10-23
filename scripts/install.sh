@@ -53,9 +53,7 @@ cat > "$AGENT" <<PLIST
 	<key>ProcessType</key>
 	<string>Interactive</string>
 	<key>StandardErrorPath</key>
-	<string>$LOG</string>
-	<key>StandardOutPath</key>
-	<string>$LOG</string>
+	<string>$HOME/Library/Logs/ThunderboltDisplays.crash.log</string>
 </dict>
 </plist>
 PLIST
