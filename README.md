@@ -4,6 +4,8 @@
 
 **Play your Mac's sound through the speakers of two Apple Thunderbolt Displays at once, with the volume keys still working.**
 
+<img width="520" height="536" alt="image" src="https://github.com/user-attachments/assets/0c879591-5b5f-43a0-b528-ef428d5b12a5" />
+
 ## What it does
 
 A Mac can normally only send sound to one display's speakers. This small menu bar app makes both of your Apple Thunderbolt Displays play together, like one pair of speakers. Your keyboard's volume and mute keys keep working, and you can choose which screen plays the left channel and which plays the right.
