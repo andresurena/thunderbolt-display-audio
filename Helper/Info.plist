@@ -6,14 +6,16 @@
 	<string>en</string>
 	<key>CFBundleExecutable</key>
 	<string>ThunderboltDisplaysHelper</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.andresurena.ThunderboltDisplays.helper</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Thunderbolt Displays Helper</string>
+	<string>Thunderbolt Displays Audio</string>
 	<key>CFBundleDisplayName</key>
-	<string>Thunderbolt Displays Helper</string>
+	<string>Thunderbolt Displays Audio</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -27,6 +29,6 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSAudioCaptureUsageDescription</key>
-	<string>Thunderbolt Displays Helper captures the audio sent to your Thunderbolt Display so it can play it through both displays. It does not use any microphone.</string>
+	<string>Thunderbolt Displays Audio captures the audio sent to your Thunderbolt Display so it can play it through both displays. It does not use any microphone.</string>
 </dict>
 </plist>

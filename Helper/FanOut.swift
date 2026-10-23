@@ -39,27 +39,29 @@ final class FanOut {
     private let outputBufferDisplay = UnsafeMutablePointer<Int32>.allocate(capacity: FanOut.maxOutputBuffers)
     /// Display index -> ChannelMode raw value.
     private let modeTable = UnsafeMutablePointer<Int32>.allocate(capacity: FanOut.maxDisplays)
+    /// Display index -> linear software gain (<= 1). Only below 1 when a level trim needs more boost
+    /// than a display's hardware volume can give: the other displays are attenuated instead.
+    private let gainTable = UnsafeMutablePointer<Float>.allocate(capacity: FanOut.maxDisplays)
+    /// Display index -> level trim in dB (control side only).
+    private var trims: [Float]
     /// Index of the tap's stereo buffer in the input list; found on the first IO cycle.
     private var sourceBufferIndex = -1
 
     /// Host time of the last non-silent buffer, written from the IO thread.
     private(set) var lastSignalHostTime: UInt64 = 0
 
-    // Identify tone state, written from the control thread, consumed on the IO thread.
-    private var identifyTarget: Int32 = -1
-    private var identifyFramesRemaining: Int32 = 0
-    private var identifyPosition: Int32 = 0
-    private var tonePhase: Float = 0
 
     // Balance gains (left speaker, right speaker), written from the control thread.
     private var gainLeft: Float = 1
     private var gainRight: Float = 1
 
-    init(mainDisplay: DeviceInfo, otherDisplays: [DeviceInfo], modes: [ChannelMode], balance: Float, listenerQueue: DispatchQueue) {
+    init(mainDisplay: DeviceInfo, otherDisplays: [DeviceInfo], modes: [ChannelMode], trims: [Float], balance: Float, listenerQueue: DispatchQueue) {
         self.mainDisplay = mainDisplay
         self.displays = Array(([mainDisplay] + otherDisplays).prefix(FanOut.maxDisplays))
         self.listenerQueue = listenerQueue
+        self.trims = (0..<min(otherDisplays.count + 1, FanOut.maxDisplays)).map { $0 < trims.count ? trims[$0] : 0 }
         outputBufferDisplay.initialize(repeating: -1, count: FanOut.maxOutputBuffers)
+        gainTable.initialize(repeating: 1, count: FanOut.maxDisplays)
         modeTable.initialize(repeating: ChannelMode.stereo.rawValue, count: FanOut.maxDisplays)
         for (index, mode) in modes.prefix(FanOut.maxDisplays).enumerated() { modeTable[index] = mode.rawValue }
         setBalance(balance)
@@ -68,6 +70,7 @@ final class FanOut {
     deinit {
         outputBufferDisplay.deallocate()
         modeTable.deallocate()
+        gainTable.deallocate()
     }
 
     func start() throws {
@@ -116,16 +119,23 @@ final class FanOut {
 
         // The aggregate finishes assembling its streams asynchronously.
         let expectedOutputChannels = displays.count * 2
+        // Displays' microphone streams plus the tap. All must be present before the input is restricted,
+        // or a late microphone stream would escape the restriction and light the microphone indicator.
+        let expectedInputStreams = displays.reduce(0) { $0 + $1.id.streamChannels(scope: kAudioObjectPropertyScopeInput).count } + 1
         var inputLayout: [Int] = []
         var outputLayout: [Int] = []
         for _ in 0..<40 {
             inputLayout = id.streamChannels(scope: kAudioObjectPropertyScopeInput)
             outputLayout = id.streamChannels(scope: kAudioObjectPropertyScopeOutput)
-            if outputLayout.reduce(0, +) >= expectedOutputChannels, inputLayout.contains(2) { break }
+            if outputLayout.reduce(0, +) >= expectedOutputChannels, inputLayout.contains(2),
+               inputLayout.count >= expectedInputStreams { break }
             Thread.sleep(forTimeInterval: 0.05)
         }
         guard inputLayout.contains(2) else {
             throw FanOutError.message("Aggregate has no stereo tap stream (input layout \(inputLayout))")
+        }
+        if inputLayout.count < expectedInputStreams {
+            log("Warning: aggregate has \(inputLayout.count) input streams, expected \(expectedInputStreams)")
         }
         deactivateMicrophoneStreams(of: id, layout: inputLayout)
 
@@ -237,6 +247,13 @@ final class FanOut {
         modeTable[index] = mode.rawValue
     }
 
+    /// Call on the listener queue.
+    func setTrim(_ value: Float, forDisplayAt index: Int) {
+        guard index >= 0, index < trims.count else { return }
+        trims[index] = value
+        mirrorControls()
+    }
+
     func mode(forDisplayAt index: Int) -> ChannelMode {
         guard index >= 0, index < displays.count else { return .stereo }
         return ChannelMode(rawValue: modeTable[index]) ?? .stereo
@@ -248,14 +265,6 @@ final class FanOut {
         let clamped = max(-1, min(1, balance))
         gainLeft = clamped > 0 ? 1 - clamped : 1
         gainRight = clamped < 0 ? 1 + clamped : 1
-    }
-
-    /// Three short beeps through one display only, so the user can tell which screen is which.
-    func playIdentifyTone(forDisplayAt index: Int) {
-        guard index >= 0, index < displays.count else { return }
-        identifyPosition = 0
-        identifyTarget = Int32(index)
-        identifyFramesRemaining = Int32(Config.sampleRate * 0.9)
     }
 
     // MARK: Real-time path. No allocation, no locks, no Swift runtime calls that might take them.
@@ -292,7 +301,6 @@ final class FanOut {
         for i in 0..<(sourceFrames * sourceChannels) where src[i] != 0 { hasSignal = true; break }
         if hasSignal { lastSignalHostTime = mach_absolute_time() }
 
-        var toneConsumed = false
         for (index, buffer) in outputList.enumerated() {
             guard let destData = buffer.mData else { continue }
             let displayIndex = index < FanOut.maxOutputBuffers ? outputBufferDisplay[index] : -1
@@ -305,15 +313,10 @@ final class FanOut {
             let destFrames = Int(buffer.mDataByteSize) / (destChannels * MemoryLayout<Float>.size)
             let dst = destData.assumingMemoryBound(to: Float.self)
 
-            if identifyFramesRemaining > 0, displayIndex == identifyTarget, !toneConsumed {
-                renderTone(into: dst, frames: destFrames, channels: destChannels)
-                toneConsumed = true
-                continue
-            }
-
             let mode = modeTable[Int(displayIndex)]
             let frames = min(sourceFrames, destFrames)
-            let left = gainLeft, right = gainRight
+            let trimGain = gainTable[Int(displayIndex)]
+            let left = gainLeft * trimGain, right = gainRight * trimGain
 
             if mode == ChannelMode.stereo.rawValue, left == 1, right == 1,
                destChannels == sourceChannels, buffer.mDataByteSize == source.mDataByteSize {
@@ -349,24 +352,6 @@ final class FanOut {
         }
     }
 
-    private func renderTone(into dst: UnsafeMutablePointer<Float>, frames: Int, channels: Int) {
-        let beepFrames = Int32(Config.sampleRate * 0.15)
-        let phaseStep = Float(2.0 * Double.pi * 660.0 / Config.sampleRate)
-        for frame in 0..<frames {
-            var sample: Float = 0
-            if identifyFramesRemaining > 0 {
-                if (identifyPosition / beepFrames) % 2 == 0 {
-                    sample = 0.25 * sinf(tonePhase)
-                    tonePhase += phaseStep
-                    if tonePhase > Float(2.0 * Double.pi) { tonePhase -= Float(2.0 * Double.pi) }
-                }
-                identifyPosition += 1
-                identifyFramesRemaining -= 1
-            }
-            for channel in 0..<channels { dst[frame * channels + channel] = sample }
-        }
-    }
-
     // MARK: Volume and mute mirroring
 
     /// The keyboard keys drive the main display's hardware volume and mute. Copy every change
@@ -380,24 +365,59 @@ final class FanOut {
         }
     }
 
+    /// Every other display follows the main display's level in dB plus its trim relative to the main one.
+    /// When a display cannot reach its target (hardware range), the difference is made up in software
+    /// by attenuating the other displays, so the balance between screens is always kept and nothing clips.
     func mirrorControls() {
-        let others = displays.dropFirst()
-        guard !others.isEmpty else { return }
-        let volume = mainDisplay.id.outputVolume(element: kAudioObjectPropertyElementMain)
-            ?? mainDisplay.id.outputVolume(element: 1)
-        if let volume {
-            for display in others {
-                for element in [kAudioObjectPropertyElementMain, 1, 2] as [AudioObjectPropertyElement] {
-                    let addr = address(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, element: element)
-                    if display.id.hasAudioProperty(addr) { display.id.setAudioValue(addr, volume) }
-                }
+        let count = displays.count
+        let mainDB = outputDecibels(of: mainDisplay)
+        if let mainDB {
+            var residual = [Float](repeating: 0, count: count)
+            for index in 1..<max(count, 1) {
+                let display = displays[index]
+                let target = mainDB + trims[index] - trims[0]
+                let applied = setOutputDecibels(of: display, target)
+                residual[index] = applied.map { target - $0 } ?? 0
+            }
+            let headroom = residual.max() ?? 0
+            for index in 0..<count {
+                gainTable[index] = Float(pow(10.0, Double(residual[index] - headroom) / 20.0))
             }
         }
         let muteAddress = address(kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeOutput)
         if let mute: UInt32 = mainDisplay.id.audioValue(muteAddress, initial: 0) {
-            for display in others where display.id.hasAudioProperty(muteAddress) {
+            for display in displays.dropFirst() where display.id.hasAudioProperty(muteAddress) {
                 display.id.setAudioValue(muteAddress, mute)
             }
         }
+    }
+
+    /// Output elements that carry a volume control: the main element if present, else channels 1 and 2.
+    private func volumeElements(of display: DeviceInfo) -> [AudioObjectPropertyElement] {
+        let main = address(kAudioDevicePropertyVolumeDecibels, scope: kAudioObjectPropertyScopeOutput)
+        if display.id.hasAudioProperty(main) { return [kAudioObjectPropertyElementMain] }
+        return [1, 2].filter {
+            display.id.hasAudioProperty(address(kAudioDevicePropertyVolumeDecibels, scope: kAudioObjectPropertyScopeOutput, element: $0))
+        }
+    }
+
+    private func outputDecibels(of display: DeviceInfo) -> Float? {
+        guard let element = volumeElements(of: display).first else { return nil }
+        return display.id.audioValue(address(kAudioDevicePropertyVolumeDecibels, scope: kAudioObjectPropertyScopeOutput, element: element), initial: Float32(0))
+    }
+
+    /// Sets the display's volume to `decibels`, clamped to its range. Returns the dB actually applied.
+    private func setOutputDecibels(of display: DeviceInfo, _ decibels: Float) -> Float? {
+        var applied: Float?
+        for element in volumeElements(of: display) {
+            let rangeAddress = address(kAudioDevicePropertyVolumeRangeDecibels, scope: kAudioObjectPropertyScopeOutput, element: element)
+            var value = decibels
+            if let range: AudioValueRange = display.id.audioValue(rangeAddress, initial: AudioValueRange()) {
+                value = min(max(value, Float(range.mMinimum)), Float(range.mMaximum))
+            }
+            display.id.setAudioValue(address(kAudioDevicePropertyVolumeDecibels, scope: kAudioObjectPropertyScopeOutput, element: element), value)
+            applied = value
+        }
+        return applied
     }
 }

@@ -203,3 +203,36 @@ extension DeviceInfo {
         return name
     }
 }
+
+extension DeviceInfo {
+    /// USB serial from the UID ("...:Display Audio:181512A7:2,1" -> "181512A7"); matches the screen's serial.
+    var serial: String {
+        let parts = uid.split(separator: ":")
+        return parts.count >= 4 ? String(parts[3]) : uid
+    }
+}
+
+// MARK: - Per-display level trim
+
+/// Corrects one display sounding quieter than the other. Stored in dB per display UID and applied to the
+/// display's hardware volume relative to the display the volume keys drive.
+enum LevelTrim {
+    static let steps: [Float] = [6, 4.5, 3, 1.5, 0, -1.5, -3, -4.5, -6]
+
+    private static func key(_ uid: String) -> String { "levelTrim." + uid }
+
+    static func load(for uid: String) -> Float {
+        Float(UserDefaults.standard.double(forKey: key(uid)))
+    }
+
+    static func save(_ value: Float, for uid: String) {
+        if value == 0 { UserDefaults.standard.removeObject(forKey: key(uid)) }
+        else { UserDefaults.standard.set(Double(value), forKey: key(uid)) }
+    }
+
+    static func describe(_ value: Float) -> String {
+        if value == 0 { return "0 dB" }
+        let text = value.truncatingRemainder(dividingBy: 1) == 0 ? String(format: "%.0f", abs(value)) : String(format: "%.1f", abs(value))
+        return (value > 0 ? "+" : "−") + text + " dB"
+    }
+}

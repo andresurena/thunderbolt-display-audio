@@ -1,21 +1,41 @@
 import CoreAudio
 import Foundation
 
+enum Side {
+    case left, right, unknown
+
+    var title: String {
+        switch self {
+        case .left: return "Left"
+        case .right: return "Right"
+        case .unknown: return ""
+        }
+    }
+}
+
 /// What the menu shows for one display.
 struct DisplaySummary {
-    let index: Int
     let uid: String
+    let serial: String
     let label: String
     let mode: ChannelMode
+    let trim: Float
     let isMain: Bool
+    let side: Side
 }
 
 struct Snapshot {
     let status: String
     let isActive: Bool
-    /// Displays present on the system (whether or not the fan-out is running), main first when active.
+    /// Displays present on the system, ordered left to right by physical placement.
     let displays: [DisplaySummary]
     let balance: Float
+    /// Serial of the display the user pinned to the left, or nil when placement is automatic.
+    let manualLeftSerial: String?
+    /// True when every display could be matched to a screen in the Displays arrangement.
+    let arrangementKnown: Bool
+    /// The Mac's output device is already one of the displays (routing may still be starting).
+    let outputIsDisplay: Bool
 }
 
 private let balanceKey = "balance"
@@ -40,6 +60,8 @@ final class Coordinator {
     private var starting: FanOut?
     private var startGeneration = 0
     private var rebuildAfterStart = false
+    private var forceAfterStart = false
+    private var pendingBalanceSave: DispatchWorkItem?
 
     func start() {
         // Deliver HAL notifications on dispatch queues instead of a run loop.
@@ -66,6 +88,7 @@ final class Coordinator {
 
     func stop() {
         queue.sync {
+            if let save = pendingBalanceSave, !save.isCancelled { save.perform() }
             pendingRebuild?.cancel()
             healthTimer?.cancel()
             startGeneration += 1   // a start still in flight will tear itself down
@@ -78,19 +101,24 @@ final class Coordinator {
 
     func snapshot() -> Snapshot {
         queue.sync {
-            let displays: [DisplaySummary]
-            if let current = fanOut {
-                displays = current.displays.enumerated().map { index, device in
-                    DisplaySummary(index: index, uid: device.uid, label: device.label,
-                                   mode: current.mode(forDisplayAt: index), isMain: index == 0)
-                }
-            } else {
-                displays = knownDisplays.enumerated().map { index, device in
-                    DisplaySummary(index: index, uid: device.uid, label: device.label,
-                                   mode: ChannelMode.load(for: device.uid), isMain: false)
-                }
+            let devices = fanOut?.displays ?? knownDisplays
+            let ordered = Placement.leftToRight(devices.map(\.serial))
+            let arrangementKnown = devices.allSatisfy { ScreenMatch.displayID(forSerial: $0.serial) != nil }
+            let positioned = arrangementKnown || Placement.manualLeftSerial != nil
+            let displays: [DisplaySummary] = ordered.enumerated().compactMap { position, serial in
+                guard let device = devices.first(where: { $0.serial == serial }) else { return nil }
+                let index = fanOut?.displays.firstIndex(of: device)
+                let side: Side = !positioned || devices.count < 2 ? .unknown
+                    : position == 0 ? .left : position == ordered.count - 1 ? .right : .unknown
+                return DisplaySummary(
+                    uid: device.uid, serial: device.serial, label: device.label,
+                    mode: index.map { fanOut!.mode(forDisplayAt: $0) } ?? ChannelMode.load(for: device.uid),
+                    trim: LevelTrim.load(for: device.uid),
+                    isMain: index == 0, side: side)
             }
-            return Snapshot(status: status, isActive: fanOut != nil, displays: displays, balance: balance)
+            return Snapshot(status: status, isActive: fanOut != nil, displays: displays, balance: balance,
+                            manualLeftSerial: Placement.manualLeftSerial, arrangementKnown: arrangementKnown,
+                            outputIsDisplay: devices.contains { $0.id == Devices.defaultOutputID() })
         }
     }
 
@@ -101,7 +129,9 @@ final class Coordinator {
     /// Make the first Thunderbolt Display the system output; the rebuild follows from the HAL notification.
     func useDisplaysAsOutput() {
         queue.async {
-            guard let first = self.knownDisplays.first else { return }
+            let current = Devices.defaultOutputID()
+            guard !self.knownDisplays.contains(where: { $0.id == current }),
+                  let first = self.knownDisplays.first else { return }
             let status = Devices.setDefaultOutput(first.id)
             log("Set default output to \(first.label): \(status)")
         }
@@ -116,20 +146,52 @@ final class Coordinator {
         }
     }
 
-    /// Left/right already assigned: swap them. Otherwise assign display 1 = left, display 2 = right.
-    func swapOrSplitLeftRight() {
+    /// Physically leftmost display plays the left channel, rightmost the right channel.
+    func splitByPlacement() {
         queue.async {
             guard let current = self.fanOut, current.displays.count >= 2 else { return }
-            let first = current.mode(forDisplayAt: 0), second = current.mode(forDisplayAt: 1)
-            let (newFirst, newSecond): (ChannelMode, ChannelMode)
-            if first == .leftOnly, second == .rightOnly { (newFirst, newSecond) = (.rightOnly, .leftOnly) }
-            else if first == .rightOnly, second == .leftOnly { (newFirst, newSecond) = (.leftOnly, .rightOnly) }
-            else { (newFirst, newSecond) = (.leftOnly, .rightOnly) }
-            for (index, mode) in [newFirst, newSecond].enumerated() {
-                mode.save(for: current.displays[index].uid)
+            let order = Placement.leftToRight(current.displays.map(\.serial))
+            for (index, display) in current.displays.enumerated() {
+                let position = order.firstIndex(of: display.serial) ?? index
+                let mode: ChannelMode = position == 0 ? .leftOnly : position == order.count - 1 ? .rightOnly : .mono
+                mode.save(for: display.uid)
                 current.setMode(mode, forDisplayAt: index)
             }
-            log("Routing: \(current.displays[0].label) -> \(newFirst.shortTitle), \(current.displays[1].label) -> \(newSecond.shortTitle)")
+            let summary = order.compactMap { serial in
+                current.displays.firstIndex { $0.serial == serial }.map { "\(current.displays[$0].label) -> \(current.mode(forDisplayAt: $0).shortTitle)" }
+            }
+            log("Routing by placement: \(summary.joined(separator: ", "))")
+        }
+    }
+
+    /// Exchange left-only and right-only on every display.
+    func swapLeftRight() {
+        queue.async {
+            guard let current = self.fanOut else { return }
+            for (index, display) in current.displays.enumerated() {
+                let mode = current.mode(forDisplayAt: index)
+                let swapped: ChannelMode = mode == .leftOnly ? .rightOnly : mode == .rightOnly ? .leftOnly : mode
+                swapped.save(for: display.uid)
+                current.setMode(swapped, forDisplayAt: index)
+            }
+            log("Routing: swapped left and right")
+        }
+    }
+
+    func setManualLeft(serial: String?) {
+        queue.async {
+            Placement.manualLeftSerial = serial
+            log(serial.map { "Placement: \($0) pinned to the left" } ?? "Placement: automatic (Displays arrangement)")
+        }
+    }
+
+    func setTrim(_ value: Float, forDisplayUID uid: String) {
+        queue.async {
+            LevelTrim.save(value, for: uid)
+            if let current = self.fanOut, let index = current.displays.firstIndex(where: { $0.uid == uid }) {
+                current.setTrim(value, forDisplayAt: index)
+            }
+            log("Level trim: \(uid.split(separator: ":").dropFirst(3).first ?? Substring(uid)) \(LevelTrim.describe(value))")
         }
     }
 
@@ -144,12 +206,18 @@ final class Coordinator {
         }
     }
 
+    /// Applied immediately; saved and logged once the slider has been still for half a second.
     func setBalance(_ value: Float) {
         queue.async {
             self.balance = max(-1, min(1, value))
-            UserDefaults.standard.set(Double(self.balance), forKey: balanceKey)
             self.fanOut?.setBalance(self.balance)
-            log("Balance: \(Coordinator.describeBalance(self.balance))")
+            self.pendingBalanceSave?.cancel()
+            let save = DispatchWorkItem {
+                UserDefaults.standard.set(Double(self.balance), forKey: balanceKey)
+                log("Balance: \(Coordinator.describeBalance(self.balance))")
+            }
+            self.pendingBalanceSave = save
+            self.queue.asyncAfter(deadline: .now() + 0.5, execute: save)
         }
     }
 
@@ -159,11 +227,12 @@ final class Coordinator {
         return value < 0 ? "\(percent)% left" : "\(percent)% right"
     }
 
+    /// Three beeps through one display, whether or not routing is active or anything is playing.
     func identify(displayUID uid: String) {
         queue.async {
-            guard let current = self.fanOut, let index = current.displays.firstIndex(where: { $0.uid == uid }) else { return }
-            log("Identify tone on \(current.displays[index].label)")
-            current.playIdentifyTone(forDisplayAt: index)
+            guard let display = (self.fanOut?.displays ?? self.knownDisplays).first(where: { $0.uid == uid }) else { return }
+            log("Identify tone on \(display.label)")
+            TestTone.play(on: display.id)
         }
     }
 
@@ -185,7 +254,10 @@ final class Coordinator {
             rebuild(force: true, reason: "health check")
             return
         }
-        let flowing = current.lastSignalHostTime != 0 && hostTimeToSeconds(mach_absolute_time() - current.lastSignalHostTime) < 2
+        // Read the IO thread's timestamp first: it can be newer than a "now" read before it.
+        let last = current.lastSignalHostTime
+        let now = mach_absolute_time()
+        let flowing = last != 0 && hostTimeToSeconds(now >= last ? now - last : 0) < 2
         if flowing != signalWasFlowing {
             signalWasFlowing = flowing
             log(flowing ? "Signal detected" : "Signal stopped")
@@ -209,6 +281,7 @@ final class Coordinator {
         if starting != nil {
             // A start is in flight (possibly waiting on the permission prompt). Re-evaluate once it ends.
             rebuildAfterStart = true
+            forceAfterStart = forceAfterStart || force
             return
         }
         let displays = Devices.displays()
@@ -239,12 +312,14 @@ final class Coordinator {
 
         let ordered = [main] + others
         let modes = ordered.map { ChannelMode.load(for: $0.uid) }
-        let candidate = FanOut(mainDisplay: main, otherDisplays: others, modes: modes, balance: balance, listenerQueue: queue)
-        let routing = zip(ordered, modes).map { "\($0.label) [\($0.id)] -> \($1.shortTitle)" }.joined(separator: ", ")
+        let trims = ordered.map { LevelTrim.load(for: $0.uid) }
+        let candidate = FanOut(mainDisplay: main, otherDisplays: others, modes: modes, trims: trims, balance: balance, listenerQueue: queue)
+        let routing = zip(ordered, zip(modes, trims)).map { "\($0.label) [\($0.id)] -> \($1.0.shortTitle), trim \(LevelTrim.describe($1.1))" }.joined(separator: ", ")
         startGeneration += 1
         let generation = startGeneration
         starting = candidate
         rebuildAfterStart = false
+        forceAfterStart = false
         status = "Starting…"
 
         queue.asyncAfter(deadline: .now() + 6) { [weak self] in
@@ -275,8 +350,10 @@ final class Coordinator {
         log("Tapping \(mainLabel) and playing through \(routing); balance \(Coordinator.describeBalance(balance))")
         status = playingStatus(candidate)
         if rebuildAfterStart {
+            let force = forceAfterStart
             rebuildAfterStart = false
-            scheduleRebuild(after: 0.5, reason: "changes while starting")
+            forceAfterStart = false
+            scheduleRebuild(after: 0.5, reason: "changes while starting", force: force)
         }
     }
 }

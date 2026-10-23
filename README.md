@@ -10,11 +10,11 @@ No driver, no system install, no microphone indicator.
 apps ──▶ Display Audio #1 (the Mac's output device; volume keys drive it natively)
               │  Core Audio process tap, muted at the source while tapped
               ▼
-   ThunderboltDisplaysHelper.app (menu bar, login item)
+   Thunderbolt Displays Audio.app (menu bar, login item, /Applications)
      • private aggregate device: [Display Audio #1 (clock) ▸ Display Audio #2] + tap
      • Core Audio drift-corrects display #2 and the tap onto display #1's clock
      • IO callback writes the tapped stereo into each display, routed per display
-     • mirrors display #1's hardware volume and mute to display #2
+     • mirrors display #1's hardware volume (in dB, plus each display's level trim) and mute to display #2
 ```
 
 * The helper is in `Helper/`. It only routes while the Mac's output device is one of the
@@ -28,12 +28,15 @@ apps ──▶ Display Audio #1 (the Mac's output device; volume keys drive it n
 ## Build and install
 
 ```bash
-scripts/build.sh      # Build/ThunderboltDisplaysHelper.app
-scripts/install.sh    # copies the helper to ~/Applications, registers the login item, starts it
+scripts/build.sh      # Build/Thunderbolt Displays Audio.app
+scripts/install.sh    # copies it to /Applications, registers the login item, starts it
 scripts/uninstall.sh
+scripts/make-icon.sh  # regenerates Helper/AppIcon.icns from Tools/MakeIcon.swift
 ```
 
-No password is needed. If macOS asks whether "Thunderbolt Displays Helper" may record system
+No password is needed on an admin account. The install waits for launchd to finish unloading the
+previous copy before loading the new one and fails loudly if the app does not start. Quit from the
+menu stops the app until next login; it is only restarted automatically after a crash. If macOS asks whether "Thunderbolt Displays Helper" may record system
 audio, click Allow. Then choose either "Display Audio" in the Sound menu, or click
 "Use Thunderbolt Displays as Output" in the helper's menu.
 
@@ -42,18 +45,29 @@ Upgrading from the first, plugin-based version: `scripts/remove-legacy-plugin.sh
 
 ## Menu
 
-* **Speakers**: each display has Stereo, Left only, Right only and Mono, plus
-  "Play Test Tone on This Display" to tell the screens apart. The display marked "(volume keys)"
-  is the one macOS outputs to.
-* **One Display per Channel / Swap Left and Right**: one-click split, then swap if it's backwards.
+* **Speakers**: displays are listed left to right. Each has Stereo, Left only, Right only and Mono,
+  a **Level** trim (−6 to +6 dB) for a display that sounds quieter, and **Identify**, which draws a
+  red outline with a caption on that screen (like System Settings › Displays) and plays three beeps
+  through its speakers. The display marked "(volume keys)" is the one macOS outputs to.
+* **Identify Displays** outlines every screen at once and beeps them in turn, left to right.
+* **Position**: automatic follows the arrangement in System Settings › Displays. Each Thunderbolt
+  Display reports the same serial to the display system as its "Display Audio" USB device, so the
+  match is exact. You can also pin which display is on the left.
+* **One Display per Channel (Left / Right)** uses that placement; **Swap Left and Right** flips it.
 * **Balance**: classic linear balance. The side you move toward stays at full level, the other
   fades to silence. Acts on each display's left/right speakers in stereo, or on the two displays
   in a split.
 * Choices are saved per display and survive restarts and replugging.
 
+Level trim works on the hardware volume: the other display follows the main one's dB value plus
+the trim difference. If a boost would exceed a display's hardware maximum, the shortfall is taken
+off the other displays in software instead, so nothing clips and the difference is kept.
+
 ## Notes
 
 * Both displays and the aggregate run at 48 kHz.
+* The test tone uses its own short IO proc on the chosen display, so it plays even while nothing
+  else does (the tap's IO is idle then).
 * `FanOut.start()` runs off the helper's main work queue. If macOS is waiting on the permission
   prompt (it cannot show one while the screen is locked), the menu says so instead of freezing.
 * Log: `~/Library/Logs/ThunderboltDisplays.log`. Menu: Rebuild Audio Routing, Show Log, Quit.
