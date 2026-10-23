@@ -4,10 +4,9 @@ import Foundation
 // MARK: - Configuration
 
 enum Config {
-    /// UID the HAL plugin publishes (kDevice_UID = kDriver_Name "_UID").
-    static let virtualDeviceUID = "Thunderbolt Displays_UID"
     static let aggregateUID = "com.andresurena.ThunderboltDisplays.fanout"
     static let aggregateName = "Thunderbolt Displays Fan-out"
+    static let tapName = "Thunderbolt Displays Tap"
     /// Name the Thunderbolt Display's USB audio reports. Override with TBD_DISPLAY_DEVICE_NAME.
     static let displayDeviceName = ProcessInfo.processInfo.environment["TBD_DISPLAY_DEVICE_NAME"] ?? "Display Audio"
     static let sampleRate: Float64 = 48000
@@ -89,6 +88,11 @@ extension AudioObjectID {
         return list.map { Int($0.mNumberChannels) }
     }
 
+    /// Scalar value of a device output volume element, if the device exposes it.
+    func outputVolume(element: AudioObjectPropertyElement) -> Float32? {
+        audioValue(address(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, element: element), initial: Float32(0))
+    }
+
     var isAlive: Bool {
         audioValue(address(kAudioDevicePropertyDeviceIsAlive), initial: UInt32(0)) == 1
     }
@@ -121,8 +125,28 @@ enum Devices {
         }
     }
 
-    static func virtualDevice() -> DeviceInfo? {
-        all().first { $0.uid == Config.virtualDeviceUID }
+    static func defaultOutputID() -> AudioObjectID {
+        AudioObjectID(kAudioObjectSystemObject).audioValue(address(kAudioHardwarePropertyDefaultOutputDevice), initial: AudioObjectID(0)) ?? 0
+    }
+
+    static func setDefaultOutput(_ id: AudioObjectID) -> OSStatus {
+        AudioObjectID(kAudioObjectSystemObject).setAudioValue(address(kAudioHardwarePropertyDefaultOutputDevice), id)
+    }
+
+    static func name(of id: AudioObjectID) -> String {
+        id.audioString(kAudioDevicePropertyDeviceNameCFString) ?? "device \(id)"
+    }
+
+    /// The HAL's process object for this process, needed to exclude ourselves from the tap.
+    static func ownProcessObjectID() -> AudioObjectID? {
+        var a = address(kAudioHardwarePropertyTranslatePIDToProcessObject)
+        var pid = getpid()
+        var object = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let status = withUnsafePointer(to: &pid) { pidPointer in
+            AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, UInt32(MemoryLayout<pid_t>.size), pidPointer, &size, &object)
+        }
+        return status == noErr && object != kAudioObjectUnknown ? object : nil
     }
 
     /// Every Thunderbolt Display speaker device, in a stable order.

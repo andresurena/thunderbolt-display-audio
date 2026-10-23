@@ -75,12 +75,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(statusLine)
         menu.addItem(.separator())
 
-        if !snapshot.displays.isEmpty {
+        if !snapshot.isActive, !snapshot.displays.isEmpty {
+            menu.addItem(action("Use Thunderbolt Displays as Output", #selector(useDisplays)))
+            menu.addItem(.separator())
+        }
+
+        if snapshot.isActive, !snapshot.displays.isEmpty {
             let header = NSMenuItem(title: "Speakers", action: nil, keyEquivalent: "")
             header.isEnabled = false
             menu.addItem(header)
             for display in snapshot.displays {
-                let entry = NSMenuItem(title: "\(display.label) — \(display.mode.shortTitle)", action: nil, keyEquivalent: "")
+                let suffix = display.isMain ? " (volume keys)" : ""
+                let entry = NSMenuItem(title: "\(display.label) — \(display.mode.shortTitle)\(suffix)", action: nil, keyEquivalent: "")
                 entry.submenu = submenu(for: display)
                 menu.addItem(entry)
             }
@@ -154,6 +160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func centreBalance() { coordinator.setBalance(0) }
+    @objc private func useDisplays() { coordinator.useDisplaysAsOutput() }
 
     @objc private func swapOrSplit() { coordinator.swapOrSplitLeftRight() }
     @objc private func setAllStereo() { coordinator.setAllStereo() }

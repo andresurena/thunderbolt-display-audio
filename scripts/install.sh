@@ -1,27 +1,58 @@
 #!/bin/bash
-# Installs the HAL plugin (needs sudo), restarts coreaudiod, installs the helper app
-# in ~/Applications and registers it as a login item (LaunchAgent).
+# Installs (or updates) the helper app in ~/Applications and registers it as a login item.
+# No sudo needed: nothing is installed system-wide.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DRIVER="$ROOT/Build/ThunderboltDisplays.driver"
 APP="$ROOT/Build/ThunderboltDisplaysHelper.app"
 LABEL="com.andresurena.ThunderboltDisplays.helper"
 AGENT="$HOME/Library/LaunchAgents/$LABEL.plist"
-HAL_DIR="/Library/Audio/Plug-Ins/HAL"
 APP_DEST="$HOME/Applications/ThunderboltDisplaysHelper.app"
 LOG="$HOME/Library/Logs/ThunderboltDisplays.log"
+[ -d "$APP" ] || { echo "Build first: $ROOT/scripts/build.sh" >&2; exit 1; }
 
-if [ ! -d "$DRIVER" ] || [ ! -d "$APP" ]; then
-  echo "Build first: $ROOT/scripts/build.sh" >&2
-  exit 1
-fi
+echo "==> Installing helper app into ~/Applications"
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+pkill -x ThunderboltDisplaysHelper 2>/dev/null || true
+mkdir -p "$HOME/Applications" "$HOME/Library/Logs" "$HOME/Library/LaunchAgents"
+rm -rf "${APP_DEST:?}"
+cp -R "$APP" "$APP_DEST"
 
-echo "==> Installing HAL plugin into $HAL_DIR (asks for your password)"
-sudo rm -rf "${HAL_DIR:?}/ThunderboltDisplays.driver"
-sudo cp -R "$DRIVER" "$HAL_DIR/"
-sudo chown -R root:wheel "$HAL_DIR/ThunderboltDisplays.driver"
+cat > "$AGENT" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$LABEL</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$APP_DEST/Contents/MacOS/ThunderboltDisplaysHelper</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardErrorPath</key>
+	<string>$LOG</string>
+	<key>StandardOutPath</key>
+	<string>$LOG</string>
+</dict>
+</plist>
+PLIST
 
-echo "==> Restarting coreaudiod (audio drops for a second)"
-sudo killall coreaudiod || true   # launchd respawns it with the new plugin
+echo "==> Starting helper"
+launchctl bootstrap "gui/$(id -u)" "$AGENT"
 
-"$ROOT/scripts/install-helper.sh"
+cat <<MSG
+
+Done.
+  1. If macOS asks whether "Thunderbolt Displays Helper" may record system audio, click Allow.
+  2. Pick either "Display Audio" as the output in the Sound menu, or use
+     "Use Thunderbolt Displays as Output" in the helper's menu bar menu.
+  3. The volume keys drive that display; the helper keeps the other one in step.
+Log: $LOG
+MSG

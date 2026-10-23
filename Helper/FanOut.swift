@@ -13,17 +13,21 @@ enum FanOutError: Error, CustomStringConvertible {
     }
 }
 
-/// Owns one private aggregate device: [virtual device (input, drift-corrected), display 1 (clock main),
-/// display 2 (drift-corrected)]. Core Audio resamples the sub-devices onto display 1's clock, so the
-/// IO callback is a plain copy of the virtual device's stereo into every display's output stream,
-/// routed per display according to its ChannelMode.
+/// Taps the audio every other process sends to the main display (the default output device), mutes it
+/// there, and replays it through every display from one private aggregate device:
+///   sub-devices [main display (clock), other displays (drift-corrected)] + tap (drift-corrected).
+/// The IO callback copies the tap's stereo into each display's output stream, routed per display.
+/// No input device is involved, so macOS shows no microphone indicator.
 final class FanOut {
-    let virtualDevice: DeviceInfo
+    /// The default output device. The keyboard keys drive its hardware volume; we mirror it to the rest.
+    let mainDisplay: DeviceInfo
+    /// All displays, main first. Output streams come in this order.
     let displays: [DeviceInfo]
 
     private(set) var aggregateID = AudioObjectID(kAudioObjectUnknown)
+    private var tapID = AudioObjectID(kAudioObjectUnknown)
+    private var tapDescription: CATapDescription?
     private var procID: AudioDeviceIOProcID?
-    private var sourceBufferIndex = 0
     private let listenerQueue: DispatchQueue
     private var controlListener: AudioObjectPropertyListenerBlock?
     private let controlSelectors = [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute]
@@ -31,11 +35,12 @@ final class FanOut {
     // Tables the IO thread reads. Fixed-size raw memory: no Swift arrays on the real-time path.
     private static let maxOutputBuffers = 32
     private static let maxDisplays = 16
-    /// Output buffer index -> display index, or -1 for the virtual device's own output streams, which
-    /// come first (sub-device order) and must only ever receive silence or the loopback echoes forever.
+    /// Output buffer index -> display index, or -1 for anything unexpected (silenced).
     private let outputBufferDisplay = UnsafeMutablePointer<Int32>.allocate(capacity: FanOut.maxOutputBuffers)
     /// Display index -> ChannelMode raw value.
     private let modeTable = UnsafeMutablePointer<Int32>.allocate(capacity: FanOut.maxDisplays)
+    /// Index of the tap's stereo buffer in the input list; found on the first IO cycle.
+    private var sourceBufferIndex = -1
 
     /// Host time of the last non-silent buffer, written from the IO thread.
     private(set) var lastSignalHostTime: UInt64 = 0
@@ -50,14 +55,14 @@ final class FanOut {
     private var gainLeft: Float = 1
     private var gainRight: Float = 1
 
-    init(virtualDevice: DeviceInfo, displays: [DeviceInfo], modes: [ChannelMode], balance: Float, listenerQueue: DispatchQueue) {
-        self.virtualDevice = virtualDevice
-        self.displays = Array(displays.prefix(FanOut.maxDisplays))
+    init(mainDisplay: DeviceInfo, otherDisplays: [DeviceInfo], modes: [ChannelMode], balance: Float, listenerQueue: DispatchQueue) {
+        self.mainDisplay = mainDisplay
+        self.displays = Array(([mainDisplay] + otherDisplays).prefix(FanOut.maxDisplays))
         self.listenerQueue = listenerQueue
-        setBalance(balance)
         outputBufferDisplay.initialize(repeating: -1, count: FanOut.maxOutputBuffers)
         modeTable.initialize(repeating: ChannelMode.stereo.rawValue, count: FanOut.maxDisplays)
         for (index, mode) in modes.prefix(FanOut.maxDisplays).enumerated() { modeTable[index] = mode.rawValue }
+        setBalance(balance)
     }
 
     deinit {
@@ -66,31 +71,46 @@ final class FanOut {
     }
 
     func start() throws {
-        for device in [virtualDevice] + displays {
+        for device in displays {
             let status = device.id.setAudioValue(address(kAudioDevicePropertyNominalSampleRate), Config.sampleRate)
-            if status != noErr { log("Could not set \(device.name) (\(device.uid)) to \(Int(Config.sampleRate)) Hz: \(status)") }
+            if status != noErr { log("Could not set \(device.label) to \(Int(Config.sampleRate)) Hz: \(status)") }
         }
 
-        var subDevices: [[String: Any]] = [[
-            kAudioSubDeviceUIDKey: virtualDevice.uid,
-            kAudioSubDeviceDriftCompensationKey: 1,
-        ]]
+        // 1. Tap everything other processes send to the main display, and mute it there while we read it.
+        let excluded = Devices.ownProcessObjectID().map { [$0] } ?? []
+        if excluded.isEmpty { log("Warning: could not find own process object; the tap may include this helper") }
+        let description = CATapDescription(excludingProcesses: excluded, deviceUID: mainDisplay.uid, stream: 0)
+        description.name = Config.tapName
+        description.isPrivate = true
+        description.muteBehavior = .mutedWhenTapped
+        var tap = AudioObjectID(kAudioObjectUnknown)
+        let tapStatus = AudioHardwareCreateProcessTap(description, &tap)
+        guard tapStatus == noErr else { throw FanOutError.status("AudioHardwareCreateProcessTap", tapStatus) }
+        tapID = tap
+        tapDescription = description
+
+        // 2. One aggregate of all displays plus the tap, clocked by the main display.
+        var subDevices: [[String: Any]] = []
         for (index, display) in displays.enumerated() {
             subDevices.append([
                 kAudioSubDeviceUIDKey: display.uid,
                 kAudioSubDeviceDriftCompensationKey: index == 0 ? 0 : 1,
             ])
         }
-        let description: [String: Any] = [
+        let aggregateDescription: [String: Any] = [
             kAudioAggregateDeviceUIDKey: Config.aggregateUID,
             kAudioAggregateDeviceNameKey: Config.aggregateName,
             kAudioAggregateDeviceIsPrivateKey: 1,
             kAudioAggregateDeviceSubDeviceListKey: subDevices,
-            kAudioAggregateDeviceMainSubDeviceKey: displays[0].uid,
+            kAudioAggregateDeviceMainSubDeviceKey: mainDisplay.uid,
+            kAudioAggregateDeviceTapListKey: [[
+                kAudioSubTapUIDKey: description.uuid.uuidString,
+                kAudioSubTapDriftCompensationKey: 1,
+            ]],
+            kAudioAggregateDeviceTapAutoStartKey: 1,
         ]
-
         var id = AudioObjectID(kAudioObjectUnknown)
-        let createStatus = AudioHardwareCreateAggregateDevice(description as CFDictionary, &id)
+        let createStatus = AudioHardwareCreateAggregateDevice(aggregateDescription as CFDictionary, &id)
         guard createStatus == noErr else { throw FanOutError.status("AudioHardwareCreateAggregateDevice", createStatus) }
         aggregateID = id
 
@@ -104,14 +124,13 @@ final class FanOut {
             if outputLayout.reduce(0, +) >= expectedOutputChannels, inputLayout.contains(2) { break }
             Thread.sleep(forTimeInterval: 0.05)
         }
-        guard let sourceIndex = inputLayout.firstIndex(of: 2) else {
-            throw FanOutError.message("Aggregate has no stereo input stream (input layout \(inputLayout))")
+        guard inputLayout.contains(2) else {
+            throw FanOutError.message("Aggregate has no stereo tap stream (input layout \(inputLayout))")
         }
-        sourceBufferIndex = sourceIndex
-        deactivateUnusedInputStreams(of: id, keeping: sourceIndex)
+        deactivateMicrophoneStreams(of: id, layout: inputLayout)
 
-        // Map output buffers to displays in sub-device order: virtual streams first, then each display's.
-        var bufferIndex = virtualDevice.id.streamChannels(scope: kAudioObjectPropertyScopeOutput).count
+        // Map output buffers to displays in sub-device order.
+        var bufferIndex = 0
         for (displayIndex, display) in displays.enumerated() {
             for _ in display.id.streamChannels(scope: kAudioObjectPropertyScopeOutput) where bufferIndex < FanOut.maxOutputBuffers {
                 outputBufferDisplay[bufferIndex] = Int32(displayIndex)
@@ -121,7 +140,7 @@ final class FanOut {
         let mapping = (0..<min(outputLayout.count, FanOut.maxOutputBuffers)).map { Int(outputBufferDisplay[$0]) }
 
         id.setAudioValue(address(kAudioDevicePropertyNominalSampleRate), Config.sampleRate)
-        log("Aggregate \(id) ready: input streams \(inputLayout), output streams \(outputLayout), source stream #\(sourceIndex), output buffer -> display \(mapping)")
+        log("Aggregate \(id) ready: input streams \(inputLayout), output streams \(outputLayout), output buffer -> display \(mapping)")
 
         var proc: AudioDeviceIOProcID?
         let procStatus = AudioDeviceCreateIOProcIDWithBlock(&proc, id, nil) { [unowned self] _, input, _, output, _ in
@@ -129,19 +148,20 @@ final class FanOut {
         }
         guard procStatus == noErr, let proc else { throw FanOutError.status("AudioDeviceCreateIOProcIDWithBlock", procStatus) }
         procID = proc
+        restrictInputToTap(aggregate: id, proc: proc, layout: inputLayout)
 
         let startStatus = AudioDeviceStart(id, proc)
         guard startStatus == noErr else { throw FanOutError.status("AudioDeviceStart", startStatus) }
 
         installControlMirror()
-        adoptDisplayLevel()
+        mirrorControls()
     }
 
     func stop() {
         if let listener = controlListener {
             for selector in controlSelectors {
-                var addr = address(selector, scope: kAudioObjectPropertyScopeOutput)
-                AudioObjectRemovePropertyListenerBlock(virtualDevice.id, &addr, listenerQueue, listener)
+                var addr = address(selector, scope: kAudioObjectPropertyScopeOutput, element: kAudioObjectPropertyElementWildcard)
+                AudioObjectRemovePropertyListenerBlock(mainDisplay.id, &addr, listenerQueue, listener)
             }
             controlListener = nil
         }
@@ -154,21 +174,60 @@ final class FanOut {
             AudioHardwareDestroyAggregateDevice(aggregateID)
             aggregateID = AudioObjectID(kAudioObjectUnknown)
         }
-    }
-
-    var isHealthy: Bool {
-        aggregateID != kAudioObjectUnknown && aggregateID.isAlive && aggregateID.isRunning
-    }
-
-    /// The displays also carry a microphone each. The helper never uses them, so switch those
-    /// streams off in the aggregate: only the virtual device's loopback stream stays active.
-    private func deactivateUnusedInputStreams(of aggregate: AudioObjectID, keeping sourceIndex: Int) {
-        let streams = aggregate.audioObjectIDs(address(kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeInput))
-        for (index, stream) in streams.enumerated() where index != sourceIndex {
-            let status = stream.setAudioValue(address(kAudioStreamPropertyIsActive), UInt32(0))
-            if status != noErr { log("Could not deactivate input stream \(index): \(status)") }
+        if tapID != kAudioObjectUnknown {
+            AudioHardwareDestroyProcessTap(tapID)
+            tapID = AudioObjectID(kAudioObjectUnknown)
         }
-        if streams.count > 1 { log("Deactivated \(streams.count - 1) microphone stream(s) in the aggregate") }
+        tapDescription = nil
+    }
+
+    /// A tap-backed aggregate reports "not running" while the tapped device is idle, so only liveness
+    /// counts here. Displays coming and going are handled by the device-list listener.
+    var isHealthy: Bool {
+        aggregateID != kAudioObjectUnknown && aggregateID.isAlive
+    }
+
+    /// The displays carry a microphone each. The helper never uses them: switch every input stream
+    /// that is not the tap's stereo stream off.
+    private func deactivateMicrophoneStreams(of aggregate: AudioObjectID, layout: [Int]) {
+        let streams = aggregate.audioObjectIDs(address(kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeInput))
+        var count = 0
+        for (index, stream) in streams.enumerated() where index < layout.count && layout[index] != 2 {
+            if stream.setAudioValue(address(kAudioStreamPropertyIsActive), UInt32(0)) == noErr { count += 1 }
+        }
+        if count > 0 { log("Deactivated \(count) microphone stream(s) in the aggregate") }
+    }
+
+    /// Tell the HAL this IO proc only reads the tap's stereo stream. The displays' microphone streams are
+    /// then never started, so macOS has no microphone use to report (deactivating the streams alone
+    /// does not survive the device going idle and restarting).
+    private func restrictInputToTap(aggregate: AudioObjectID, proc: AudioDeviceIOProcID, layout: [Int]) {
+        let count = layout.count
+        guard count > 0 else { return }
+        let headerSize = MemoryLayout<UnsafeMutableRawPointer?>.size + MemoryLayout<UInt32>.size
+        let byteCount = headerSize + count * MemoryLayout<UInt32>.size
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: MemoryLayout<UnsafeMutableRawPointer>.alignment)
+        defer { raw.deallocate() }
+        raw.initializeMemory(as: UInt8.self, repeating: 0, count: byteCount)
+        raw.storeBytes(of: unsafeBitCast(proc, to: UnsafeMutableRawPointer.self), as: UnsafeMutableRawPointer.self)
+        raw.storeBytes(of: UInt32(count), toByteOffset: MemoryLayout<UnsafeMutableRawPointer?>.size, as: UInt32.self)
+        var usageAddress = address(kAudioDevicePropertyIOProcStreamUsage, scope: kAudioObjectPropertyScopeInput)
+        var size = UInt32(byteCount)
+        let getStatus = AudioObjectGetPropertyData(aggregate, &usageAddress, 0, nil, &size, raw)
+        guard getStatus == noErr else { log("Could not read input stream usage: \(getStatus)"); return }
+        let flags = (raw + headerSize).assumingMemoryBound(to: UInt32.self)
+        var kept: [Int] = []
+        for index in 0..<count {
+            let isTap = layout[index] == 2
+            flags[index] = isTap ? 1 : 0
+            if isTap { kept.append(index) }
+        }
+        let setStatus = AudioObjectSetPropertyData(aggregate, &usageAddress, 0, nil, UInt32(byteCount), raw)
+        if setStatus == noErr {
+            log("Input limited to tap stream \(kept); \(count - kept.count) microphone stream(s) never started")
+        } else {
+            log("Could not limit input streams: \(setStatus) (\(fourCharCode(UInt32(bitPattern: setStatus))))")
+        }
     }
 
     // MARK: Routing controls (any thread; the IO thread picks the values up on its next cycle)
@@ -205,7 +264,18 @@ final class FanOut {
         let inputList = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
         let outputList = UnsafeMutableAudioBufferListPointer(output)
 
-        guard sourceBufferIndex < inputList.count, let sourceData = inputList[sourceBufferIndex].mData else {
+        // The tap is the only stereo input stream; find it once. Deactivated mic streams may or may
+        // not still appear in the list, so this cannot be computed from the layout ahead of time.
+        if sourceBufferIndex < 0 {
+            var found = -1
+            for index in 0..<inputList.count where inputList[index].mNumberChannels == 2 && inputList[index].mDataByteSize > 0 {
+                found = index
+                break
+            }
+            sourceBufferIndex = found
+        }
+
+        guard sourceBufferIndex >= 0, sourceBufferIndex < inputList.count, let sourceData = inputList[sourceBufferIndex].mData else {
             for buffer in outputList {
                 if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
             }
@@ -299,21 +369,24 @@ final class FanOut {
 
     // MARK: Volume and mute mirroring
 
-    /// The virtual device carries the volume and mute controls the keyboard keys drive.
-    /// Every change is copied to the displays' own hardware controls.
+    /// The keyboard keys drive the main display's hardware volume and mute. Copy every change
+    /// to the other displays so they stay in step.
     private func installControlMirror() {
         let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.mirrorControls() }
         controlListener = listener
         for selector in controlSelectors {
-            var addr = address(selector, scope: kAudioObjectPropertyScopeOutput)
-            AudioObjectAddPropertyListenerBlock(virtualDevice.id, &addr, listenerQueue, listener)
+            var addr = address(selector, scope: kAudioObjectPropertyScopeOutput, element: kAudioObjectPropertyElementWildcard)
+            AudioObjectAddPropertyListenerBlock(mainDisplay.id, &addr, listenerQueue, listener)
         }
     }
 
     func mirrorControls() {
-        let volumeAddress = address(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput)
-        if let volume: Float32 = virtualDevice.id.audioValue(volumeAddress, initial: 0) {
-            for display in displays {
+        let others = displays.dropFirst()
+        guard !others.isEmpty else { return }
+        let volume = mainDisplay.id.outputVolume(element: kAudioObjectPropertyElementMain)
+            ?? mainDisplay.id.outputVolume(element: 1)
+        if let volume {
+            for display in others {
                 for element in [kAudioObjectPropertyElementMain, 1, 2] as [AudioObjectPropertyElement] {
                     let addr = address(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, element: element)
                     if display.id.hasAudioProperty(addr) { display.id.setAudioValue(addr, volume) }
@@ -321,19 +394,10 @@ final class FanOut {
             }
         }
         let muteAddress = address(kAudioDevicePropertyMute, scope: kAudioObjectPropertyScopeOutput)
-        if let mute: UInt32 = virtualDevice.id.audioValue(muteAddress, initial: 0) {
-            for display in displays where display.id.hasAudioProperty(muteAddress) {
+        if let mute: UInt32 = mainDisplay.id.audioValue(muteAddress, initial: 0) {
+            for display in others where display.id.hasAudioProperty(muteAddress) {
                 display.id.setAudioValue(muteAddress, mute)
             }
         }
-    }
-
-    /// Start from the first display's current level so nothing jumps when the helper launches.
-    private func adoptDisplayLevel() {
-        let displayVolume = address(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, element: 1)
-        if let level: Float32 = displays[0].id.audioValue(displayVolume, initial: 0) {
-            virtualDevice.id.setAudioValue(address(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput), level)
-        }
-        mirrorControls()
     }
 }

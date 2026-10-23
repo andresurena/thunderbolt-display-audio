@@ -21,12 +21,12 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>13.0</string>
+	<string>14.2</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>Thunderbolt Displays Helper reads the audio sent to the "Thunderbolt Displays" output so it can play it through both displays. It does not use any microphone.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Thunderbolt Displays Helper captures the audio sent to your Thunderbolt Display so it can play it through both displays. It does not use any microphone.</string>
 </dict>
 </plist>

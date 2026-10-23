@@ -1,74 +1,60 @@
 # Thunderbolt Displays Audio
 
-One macOS output device, "Thunderbolt Displays", that plays through the speakers of
-both Apple Thunderbolt Displays at once, with working keyboard volume and mute keys.
+Plays your Mac's audio through the speakers of both Apple Thunderbolt Displays at once, with
+working keyboard volume and mute keys, per-display left/right positioning and a balance slider.
+No driver, no system install, no microphone indicator.
 
 ## How it works
 
 ```
-apps ──▶ "Thunderbolt Displays" (HAL plugin, loopback)
-                 │ volume / mute controls (driven by the keyboard keys)
-                 ▼
-     ThunderboltDisplaysHelper.app (menu bar, login item)
-       • private aggregate device: [virtual ▸ Display Audio #1 (clock) ▸ Display Audio #2]
-       • Core Audio drift-corrects the other two onto display #1's clock
-       • IO callback copies the stereo into every display's output stream
-       • mirrors the virtual device's volume/mute to each display's hardware volume
+apps ──▶ Display Audio #1 (the Mac's output device; volume keys drive it natively)
+              │  Core Audio process tap, muted at the source while tapped
+              ▼
+   ThunderboltDisplaysHelper.app (menu bar, login item)
+     • private aggregate device: [Display Audio #1 (clock) ▸ Display Audio #2] + tap
+     • Core Audio drift-corrects display #2 and the tap onto display #1's clock
+     • IO callback writes the tapped stereo into each display, routed per display
+     • mirrors display #1's hardware volume and mute to display #2
 ```
 
-* `Plugin/ThunderboltDisplaysConfig.h` configures the HAL plugin, built from the vendored
-  [BlackHole](https://github.com/ExistentialAudio/BlackHole) source (GPLv3). The plugin keeps
-  BlackHole's volume/mute controls but does not attenuate in software (`kEnableVolumeControl false`).
-* `Helper/` is the Swift helper. It finds every USB device named "Display Audio" with an output,
-  builds the aggregate, and rebuilds it when displays come and go.
+* The helper is in `Helper/`. It only routes while the Mac's output device is one of the
+  Thunderbolt Displays. Pick any other output and it goes idle; pick a display again and it resumes.
+* The tap excludes the helper's own process, so its output is never tapped back into itself.
+* The IO proc's input is limited to the tap stream, so the displays' microphones are never started.
+  macOS shows only the small purple "system audio recording" dot by Control Center, not the
+  orange microphone indicator.
+* Requires macOS 14.2 or later (process taps).
 
 ## Build and install
 
 ```bash
-scripts/build.sh           # Build/ThunderboltDisplays.driver + Build/ThunderboltDisplaysHelper.app
-scripts/install.sh         # sudo for the plugin + coreaudiod restart, then installs the helper
-scripts/install-helper.sh  # helper only (no sudo): rebuild + reinstall after changing Helper/
+scripts/build.sh      # Build/ThunderboltDisplaysHelper.app
+scripts/install.sh    # copies the helper to ~/Applications, registers the login item, starts it
 scripts/uninstall.sh
 ```
 
-coreaudiod is restarted with `killall coreaudiod` (launchd respawns it); `launchctl kickstart`
-is refused under System Integrity Protection on macOS 26. The helper is signed with the local
-"Apple Development" identity when one exists, so the microphone permission survives rebuilds.
+No password is needed. If macOS asks whether "Thunderbolt Displays Helper" may record system
+audio, click Allow. Then choose either "Display Audio" in the Sound menu, or click
+"Use Thunderbolt Displays as Output" in the helper's menu.
 
-After installing: allow the microphone prompt for the helper (it only reads the virtual device),
-then choose "Thunderbolt Displays" in the Sound menu.
+Upgrading from the first, plugin-based version: `scripts/remove-legacy-plugin.sh` removes the old
+"Thunderbolt Displays" virtual device (needs your password, restarts coreaudiod).
 
-## Positioning left and right
+## Menu
 
-Click the menu bar icon. Each display has a submenu:
-
-* **Stereo (left + right)** — default, both channels on that display.
-* **Left channel only** / **Right channel only** — use one display per channel for a wide stereo image.
-* **Mono (left + right mixed)**.
-* **Play Test Tone on This Display** — three beeps through that display only, so you know which is which.
-
-"One Display per Channel" assigns display 1 = left, display 2 = right in one click; it becomes
-"Swap Left and Right" once a split is active. Choices are stored per display UID in the helper's
-preferences and survive restarts and replugging. Switching takes effect immediately.
-
-## Balance
-
-The menu has a left/right balance slider (macOS no longer shows one for most devices). It behaves
-like the classic control: the side you move toward stays at full level, the other side is attenuated
-linearly to silence. In stereo mode it acts on each display's own left/right speakers; in a
-left/right split it acts on the two displays. The value persists.
+* **Speakers**: each display has Stereo, Left only, Right only and Mono, plus
+  "Play Test Tone on This Display" to tell the screens apart. The display marked "(volume keys)"
+  is the one macOS outputs to.
+* **One Display per Channel / Swap Left and Right**: one-click split, then swap if it's backwards.
+* **Balance**: classic linear balance. The side you move toward stays at full level, the other
+  fades to silence. Acts on each display's left/right speakers in stereo, or on the two displays
+  in a split.
+* Choices are saved per display and survive restarts and replugging.
 
 ## Notes
 
-* The virtual device runs at 48 kHz; the helper switches both displays to 48 kHz.
-* The helper adopts display #1's current volume when it starts, so nothing jumps.
-* The aggregate also carries the virtual device's own output stream; the helper writes silence to
-  it (never the audio), otherwise the loopback would echo forever.
-* The menu bar status shows "audio flowing" / "silent"; the log records "Signal detected" / "Signal stopped".
-* macOS shows the orange microphone indicator while the helper runs: reading the loopback input
-  counts as audio input, even though the helper deactivates the displays' real microphone streams
-  in its aggregate and never touches them. Same behaviour as Background Music, eqMac and Loopback.
-* "Thunderbolt Displays" also appears as an *input* device. That is the loopback the helper reads;
-  ignore it (or pick it in another app to record system audio, like BlackHole).
-* Log: `~/Library/Logs/ThunderboltDisplays.log`. Menu bar: Rebuild Audio Routing, Show Log, Quit.
-* Different display? Set `TBD_DISPLAY_DEVICE_NAME` in the LaunchAgent to the device name to match.
+* Both displays and the aggregate run at 48 kHz.
+* `FanOut.start()` runs off the helper's main work queue. If macOS is waiting on the permission
+  prompt (it cannot show one while the screen is locked), the menu says so instead of freezing.
+* Log: `~/Library/Logs/ThunderboltDisplays.log`. Menu: Rebuild Audio Routing, Show Log, Quit.
+* Different display model? Set `TBD_DISPLAY_DEVICE_NAME` in the LaunchAgent to its device name.
