@@ -4,7 +4,7 @@
 
 **Play your Mac's sound through the speakers of two Apple Thunderbolt Displays at once, with the volume keys still working.**
 
-<img width="520" height="536" alt="image" src="https://github.com/user-attachments/assets/0c879591-5b5f-43a0-b528-ef428d5b12a5" />
+<img width="1084" height="649" alt="CleanShot 2026-10-23 at 13 03 54" src="https://github.com/user-attachments/assets/7ba2232e-d0b1-4de6-861b-86af0f177a50" />
 
 ## What it does
 
