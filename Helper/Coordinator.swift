@@ -52,6 +52,8 @@ final class Coordinator {
     private var status = "Starting…"
     private var balance = Float(UserDefaults.standard.double(forKey: balanceKey))
     private var signalWasFlowing = false
+    private var reportedTotal: UInt64 = 0
+    private var lastDropoutReport = Date.distantPast
     private var knownDisplays: [DeviceInfo] = []
 
     /// FanOut.start() can block for as long as macOS waits on the audio-capture permission prompt
@@ -258,6 +260,15 @@ final class Coordinator {
         let last = current.lastSignalHostTime
         let now = mach_absolute_time()
         let flowing = last != 0 && hostTimeToSeconds(now >= last ? now - last : 0) < 2
+        // Report dropouts at most every 10 s, with totals, so a bad stretch is visible without flooding the log.
+        let gaps = current.discontinuities, overloads = current.overloads
+        let inputGaps = current.inputDiscontinuities, holes = current.inputHoles
+        let totals = gaps &+ overloads &+ inputGaps &+ holes
+        if totals != reportedTotal, Date().timeIntervalSince(lastDropoutReport) >= 10 {
+            log("Dropouts so far: \(gaps) output skip(s), \(overloads) overload(s), \(inputGaps) tap timeline jump(s), \(holes) tap hole(s); buffer \(current.bufferFrames) frames")
+            reportedTotal = totals
+            lastDropoutReport = Date()
+        }
         if flowing != signalWasFlowing {
             signalWasFlowing = flowing
             log(flowing ? "Signal detected" : "Signal stopped")
@@ -347,6 +358,7 @@ final class Coordinator {
             return
         }
         fanOut = candidate
+        reportedTotal = 0
         log("Tapping \(mainLabel) and playing through \(routing); balance \(Coordinator.describeBalance(balance))")
         status = playingStatus(candidate)
         if rebuildAfterStart {

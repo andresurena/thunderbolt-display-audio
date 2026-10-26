@@ -50,6 +50,23 @@ final class FanOut {
     /// Host time of the last non-silent buffer, written from the IO thread.
     private(set) var lastSignalHostTime: UInt64 = 0
 
+    // Dropout diagnostics, written on the IO thread or the HAL notification queue, read by the health timer.
+    /// IO cycles whose output timeline did not continue where the previous one ended (a skipped cycle).
+    private(set) var discontinuities: UInt64 = 0
+    /// kAudioDeviceProcessorOverload notifications on the aggregate (the IO proc missed its deadline).
+    private(set) var overloads: UInt64 = 0
+    /// Buffer size of the aggregate, for the log.
+    private(set) var bufferFrames: UInt32 = 0
+    private var expectedOutputSampleTime: Float64 = -1
+    /// Tap input cycles whose timeline jumped (input arrived late or was dropped).
+    private(set) var inputDiscontinuities: UInt64 = 0
+    /// Single silent cycles sandwiched between cycles with sound: a hole in the tapped audio.
+    private(set) var inputHoles: UInt64 = 0
+    private var expectedInputSampleTime: Float64 = -1
+    private var previousCycleHadSignal = false
+    private var silentCyclesInRow = 0
+    private var overloadListener: AudioObjectPropertyListenerBlock?
+
 
     // Balance gains (left speaker, right speaker), written from the control thread.
     private var gainLeft: Float = 1
@@ -74,9 +91,15 @@ final class FanOut {
     }
 
     func start() throws {
+        // Only touch a rate that differs. Setting it, even to the same value, reconfigures the device and
+        // the tap then misses any stream that was already playing (it hears silence until that app restarts).
         for device in displays {
-            let status = device.id.setAudioValue(address(kAudioDevicePropertyNominalSampleRate), Config.sampleRate)
-            if status != noErr { log("Could not set \(device.label) to \(Int(Config.sampleRate)) Hz: \(status)") }
+            let rateAddress = address(kAudioDevicePropertyNominalSampleRate)
+            let current = device.id.audioValue(rateAddress, initial: Float64(0)) ?? 0
+            guard current != Config.sampleRate else { continue }
+            let status = device.id.setAudioValue(rateAddress, Config.sampleRate)
+            log(status == noErr ? "Changed \(device.label) from \(Int(current)) to \(Int(Config.sampleRate)) Hz"
+                                : "Could not set \(device.label) to \(Int(Config.sampleRate)) Hz: \(status)")
         }
 
         // 1. Tap everything other processes send to the main display, and mute it there while we read it.
@@ -101,7 +124,9 @@ final class FanOut {
             ])
         }
         let aggregateDescription: [String: Any] = [
-            kAudioAggregateDeviceUIDKey: Config.aggregateUID,
+            // Unique per build: if a previous copy died without tearing its aggregate down, Core Audio keeps
+            // that UID reserved and creating another with the same UID fails ('nope') until coreaudiod restarts.
+            kAudioAggregateDeviceUIDKey: "\(Config.aggregateUID).\(getpid()).\(UUID().uuidString.prefix(8))",
             kAudioAggregateDeviceNameKey: Config.aggregateName,
             kAudioAggregateDeviceIsPrivateKey: 1,
             kAudioAggregateDeviceSubDeviceListKey: subDevices,
@@ -149,11 +174,17 @@ final class FanOut {
         }
         let mapping = (0..<min(outputLayout.count, FanOut.maxOutputBuffers)).map { Int(outputBufferDisplay[$0]) }
 
-        id.setAudioValue(address(kAudioDevicePropertyNominalSampleRate), Config.sampleRate)
+        let aggregateRate = id.audioValue(address(kAudioDevicePropertyNominalSampleRate), initial: Float64(0)) ?? 0
+        if aggregateRate != Config.sampleRate {
+            id.setAudioValue(address(kAudioDevicePropertyNominalSampleRate), Config.sampleRate)
+            log("Changed the aggregate from \(Int(aggregateRate)) to \(Int(Config.sampleRate)) Hz")
+        }
         log("Aggregate \(id) ready: input streams \(inputLayout), output streams \(outputLayout), output buffer -> display \(mapping)")
 
         var proc: AudioDeviceIOProcID?
-        let procStatus = AudioDeviceCreateIOProcIDWithBlock(&proc, id, nil) { [unowned self] _, input, _, output, _ in
+        let procStatus = AudioDeviceCreateIOProcIDWithBlock(&proc, id, nil) { [unowned self] _, input, inputTime, output, outputTime in
+            self.trackTimeline(outputTime, frames: output.pointee.mBuffers.mDataByteSize)
+            self.trackInputTimeline(inputTime, frames: output.pointee.mBuffers.mDataByteSize)
             self.render(input: input, output: output)
         }
         guard procStatus == noErr, let proc else { throw FanOutError.status("AudioDeviceCreateIOProcIDWithBlock", procStatus) }
@@ -164,10 +195,17 @@ final class FanOut {
         guard startStatus == noErr else { throw FanOutError.status("AudioDeviceStart", startStatus) }
 
         installControlMirror()
+        installOverloadCounter()
+        bufferFrames = id.audioValue(address(kAudioDevicePropertyBufferFrameSize), initial: UInt32(0)) ?? 0
         mirrorControls()
     }
 
     func stop() {
+        if let listener = overloadListener {
+            var addr = address(kAudioDeviceProcessorOverload)
+            AudioObjectRemovePropertyListenerBlock(aggregateID, &addr, listenerQueue, listener)
+            overloadListener = nil
+        }
         if let listener = controlListener {
             for selector in controlSelectors {
                 var addr = address(selector, scope: kAudioObjectPropertyScopeOutput, element: kAudioObjectPropertyElementWildcard)
@@ -240,6 +278,32 @@ final class FanOut {
         }
     }
 
+    // MARK: Dropout diagnostics
+
+    private func installOverloadCounter() {
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.overloads &+= 1 }
+        overloadListener = listener
+        var addr = address(kAudioDeviceProcessorOverload)
+        AudioObjectAddPropertyListenerBlock(aggregateID, &addr, listenerQueue, listener)
+    }
+
+    /// IO thread. Each cycle's output should start exactly where the previous one ended.
+    private func trackTimeline(_ time: UnsafePointer<AudioTimeStamp>, frames byteSize: UInt32) {
+        guard time.pointee.mFlags.contains(.sampleTimeValid) else { return }
+        let start = time.pointee.mSampleTime
+        if expectedOutputSampleTime >= 0, abs(start - expectedOutputSampleTime) > 0.5 { discontinuities &+= 1 }
+        let frames = Float64(byteSize) / Float64(2 * MemoryLayout<Float>.size)
+        expectedOutputSampleTime = start + frames
+    }
+
+    /// IO thread. Same check for the tap side.
+    private func trackInputTimeline(_ time: UnsafePointer<AudioTimeStamp>, frames byteSize: UInt32) {
+        guard time.pointee.mFlags.contains(.sampleTimeValid) else { return }
+        let start = time.pointee.mSampleTime
+        if expectedInputSampleTime >= 0, abs(start - expectedInputSampleTime) > 0.5 { inputDiscontinuities &+= 1 }
+        expectedInputSampleTime = start + Float64(byteSize) / Float64(2 * MemoryLayout<Float>.size)
+    }
+
     // MARK: Routing controls (any thread; the IO thread picks the values up on its next cycle)
 
     func setMode(_ mode: ChannelMode, forDisplayAt index: Int) {
@@ -300,6 +364,15 @@ final class FanOut {
         var hasSignal = false
         for i in 0..<(sourceFrames * sourceChannels) where src[i] != 0 { hasSignal = true; break }
         if hasSignal { lastSignalHostTime = mach_absolute_time() }
+        // A lone silent cycle between two cycles with sound is a hole in the tap, heard as a click.
+        if hasSignal {
+            if silentCyclesInRow == 1, previousCycleHadSignal { inputHoles &+= 1 }
+            silentCyclesInRow = 0
+            previousCycleHadSignal = true
+        } else {
+            if silentCyclesInRow == 0 { /* first silent cycle after sound */ } else { previousCycleHadSignal = false }
+            silentCyclesInRow += 1
+        }
 
         for (index, buffer) in outputList.enumerated() {
             guard let destData = buffer.mData else { continue }
