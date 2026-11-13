@@ -35,7 +35,8 @@ private let logHandle: FileHandle? = {
 func log(_ message: String) {
     let line = "\(timestampFormatter.string(from: Date())) \(message)\n"
     logQueue.async {
-        if let handle = logHandle { handle.write(Data(line.utf8)) } else { FileHandle.standardError.write(Data(line.utf8)) }
+        // try?: the throwing API. The older write(_:) raises an exception (and crashes) when the disk is full.
+        if let handle = logHandle { try? handle.write(contentsOf: Data(line.utf8)) } else { FileHandle.standardError.write(Data(line.utf8)) }
     }
 }
 

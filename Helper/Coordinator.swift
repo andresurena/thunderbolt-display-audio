@@ -62,6 +62,8 @@ final class Coordinator {
     private var starting: FanOut?
     private var startGeneration = 0
     private var rebuildAfterStart = false
+    private var pendingForce = false
+    private var startFailures = 0
     private var forceAfterStart = false
     private var pendingBalanceSave: DispatchWorkItem?
 
@@ -106,7 +108,9 @@ final class Coordinator {
             let devices = fanOut?.displays ?? knownDisplays
             let ordered = Placement.leftToRight(devices.map(\.serial))
             let arrangementKnown = devices.allSatisfy { ScreenMatch.displayID(forSerial: $0.serial) != nil }
-            let positioned = arrangementKnown || Placement.manualLeftSerial != nil
+            // A pin only places the displays if the pinned display is actually here.
+            let pinPresent = Placement.manualLeftSerial.map { pin in devices.contains { $0.serial == pin } } ?? false
+            let positioned = arrangementKnown || pinPresent
             let displays: [DisplaySummary] = ordered.enumerated().compactMap { position, serial in
                 guard let device = devices.first(where: { $0.serial == serial }) else { return nil }
                 let index = fanOut?.displays.firstIndex(of: device)
@@ -243,8 +247,14 @@ final class Coordinator {
 
     private func scheduleRebuild(after delay: TimeInterval, reason: String, force: Bool = false) {
         queue.async {
+            // A forced rebuild that gets replaced by a later request stays forced.
             self.pendingRebuild?.cancel()
-            let item = DispatchWorkItem { self.rebuild(force: force, reason: reason) }
+            let carried = force || self.pendingForce
+            self.pendingForce = carried
+            let item = DispatchWorkItem {
+                self.pendingForce = false
+                self.rebuild(force: carried, reason: reason)
+            }
             self.pendingRebuild = item
             self.queue.asyncAfter(deadline: .now() + delay, execute: item)
         }
@@ -357,11 +367,20 @@ final class Coordinator {
         guard generation == startGeneration else { candidate.stop(); return }
         if let failure {
             candidate.stop()
-            log("Could not start fan-out: \(failure)")
+            // Back off (5, 10, 20, 40, then every 60 s) so a start that keeps failing doesn't flood the log.
+            startFailures += 1
+            let delay = min(60.0, 5.0 * pow(2.0, Double(startFailures - 1)))
+            log("Could not start fan-out: \(failure); retrying in \(Int(delay)) s")
             status = "Error: \(failure)"
-            scheduleRebuild(after: 5, reason: "retry after error", force: true)
+            scheduleRebuild(after: delay, reason: "retry after error", force: true)
             return
         }
+        startFailures = 0
+        // Anything changed in the menu while the start was in flight (it can wait a long time on the
+        // permission prompt) was saved but never reached this FanOut. Apply the saved settings now.
+        candidate.apply(modes: candidate.displays.map { ChannelMode.load(for: $0.uid) },
+                        trims: candidate.displays.map { LevelTrim.load(for: $0.uid) },
+                        balance: balance)
         fanOut = candidate
         reportedTotal = 0
         log("Tapping \(mainLabel) and playing through \(routing); balance \(Coordinator.describeBalance(balance))")

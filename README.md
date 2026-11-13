@@ -27,7 +27,7 @@ The first time it runs, macOS asks whether the app may record the sound your Mac
 
 **[Download the latest version](https://github.com/andresurena/thunderbolt-display-audio/releases/latest/download/Thunderbolt-Displays-Audio.zip)** · [all releases](https://github.com/andresurena/thunderbolt-display-audio/releases/latest)
 
-You need macOS 14.2 (Sonoma) or later and two Apple Thunderbolt Displays connected. It has been tested on macOS 26 with two Apple Thunderbolt Displays.
+You need macOS 14.2 (Sonoma) or later and two Apple Thunderbolt Displays connected. It runs on both Apple silicon and Intel Macs. It has been tested on macOS 26 on an Apple silicon Mac with two Apple Thunderbolt Displays.
 
 ## First run
 
@@ -99,8 +99,11 @@ scripts/build.sh                 # Build/Thunderbolt Displays Audio.app
 scripts/install.sh               # copies it to /Applications, adds a login item (LaunchAgent), starts it
 scripts/install.sh --no-login    # same, but leaves Open at Login off
 scripts/uninstall.sh             # removes the app and any login item
+scripts/package-release.sh       # builds, checks and zips Build/release/Thunderbolt-Displays-Audio.zip
 scripts/make-icon.sh             # regenerates Helper/AppIcon.icns from Tools/MakeIcon.swift
 ```
+
+The build is a universal binary (arm64 and x86_64) targeting the `LSMinimumSystemVersion` in `Helper/Info.plist`. `package-release.sh` refuses to produce a zip if either slice is missing or built for a newer macOS.
 
 Open at Login can also be read or changed without opening the app:
 
@@ -130,6 +133,7 @@ Log: `~/Library/Logs/ThunderboltDisplays.log` (also under **Show Log** in the me
 
 - Only tested with Apple Thunderbolt Displays. Other displays whose speakers appear as "Display Audio" over USB may work; set `TBD_DISPLAY_DEVICE_NAME` in the environment to match a different device name. Untested.
 - Releases are signed with an Apple Development certificate and are not notarised, hence the Open Anyway step above.
+- The Intel build and macOS 14 and 15 are compiled for but not tested on real hardware. Versions 1.0 and 1.0.1 only ran on Apple silicon Macs with macOS 26; use 1.0.2 or later.
 
 ## Licence
 

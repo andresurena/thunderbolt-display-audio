@@ -183,6 +183,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             levels.addItem(item)
         }
         level.submenu = levels
+        if solo {
+            // Level sets one display against the other; alone it has nothing to act on.
+            level.title = "Level (needs two displays)"
+            level.submenu = nil
+            level.isEnabled = false
+        }
         sub.addItem(level)
         sub.addItem(.separator())
 
@@ -344,8 +350,14 @@ if let flag = CommandLine.arguments.firstIndex(of: "--login-item") {
 }
 
 // Only one copy may run: two would each build their own tap and fight over the displays.
+// The file lock decides it atomically (two copies launched at the same instant can't both win or
+// both lose); the running-applications check also covers a copy started before the lock existed.
+let lockPath = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Caches/com.andresurena.ThunderboltDisplays.lock").path
+let lockFD = open(lockPath, O_CREAT | O_RDWR, 0o600)   // kept open for the life of the process
+let lockTaken = lockFD >= 0 && flock(lockFD, LOCK_EX | LOCK_NB) != 0
 let myPID = ProcessInfo.processInfo.processIdentifier
-if NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+if lockTaken || NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
     .contains(where: { $0.processIdentifier != myPID }) {
     log("Another copy is already running; exiting")
     Thread.sleep(forTimeInterval: 0.2)   // let the log line flush

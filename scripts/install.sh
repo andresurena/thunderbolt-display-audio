@@ -30,6 +30,9 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 pkill -x ThunderboltDisplaysHelper 2>/dev/null || true
+# Wait for the old copy to be gone: a new copy that still sees it exits as a duplicate.
+for _ in $(seq 1 25); do pgrep -x ThunderboltDisplaysHelper >/dev/null || break; sleep 0.2; done
+pkill -9 -x ThunderboltDisplaysHelper 2>/dev/null || true
 
 echo "==> Installing into /Applications"
 mkdir -p "$HOME/Library/Logs" "$HOME/Library/LaunchAgents"
@@ -45,6 +48,7 @@ if [ "$LOGIN" = 0 ]; then
   echo "==> Starting the app (not added to login)"
   open -g "$APP_DEST"
   for _ in $(seq 1 25); do pgrep -x ThunderboltDisplaysHelper >/dev/null && break; sleep 0.2; done
+  sleep 1.5   # a copy that exits straight away must not count as started
   if ! pgrep -x ThunderboltDisplaysHelper >/dev/null; then
     echo "ERROR: the app did not start. Open it from /Applications to see why." >&2
     exit 1
@@ -97,6 +101,7 @@ for attempt in 1 2 3 4 5; do
   sleep 1
 done
 for _ in $(seq 1 25); do pgrep -x ThunderboltDisplaysHelper >/dev/null && break; sleep 0.2; done
+sleep 1.5   # a copy that exits straight away must not count as started
 if ! pgrep -x ThunderboltDisplaysHelper >/dev/null; then
   echo "ERROR: the helper did not start. Check: launchctl print $DOMAIN/$LABEL" >&2
   exit 1

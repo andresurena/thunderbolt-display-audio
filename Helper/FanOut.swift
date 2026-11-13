@@ -106,8 +106,11 @@ final class FanOut {
         }
 
         // 1. Tap everything other processes send to the main display, and mute it there while we read it.
-        let excluded = Devices.ownProcessObjectID().map { [$0] } ?? []
-        if excluded.isEmpty { log("Warning: could not find own process object; the tap may include this helper") }
+        // Without this exclusion the tap would capture, and mute, this app's own output.
+        guard let ownProcess = Devices.ownProcessObjectID() else {
+            throw FanOutError.message("Could not find this app's own audio process object")
+        }
+        let excluded = [ownProcess]
         let description = CATapDescription(excludingProcesses: excluded, deviceUID: mainDisplay.uid, stream: 0)
         description.name = Config.tapName
         description.isPrivate = true
@@ -186,8 +189,11 @@ final class FanOut {
 
         var proc: AudioDeviceIOProcID?
         let procStatus = AudioDeviceCreateIOProcIDWithBlock(&proc, id, nil) { [unowned self] _, input, inputTime, output, outputTime in
-            self.trackTimeline(outputTime, frames: output.pointee.mBuffers.mDataByteSize)
-            self.trackInputTimeline(inputTime, frames: output.pointee.mBuffers.mDataByteSize)
+            let first = output.pointee.mBuffers
+            let frames = first.mNumberChannels > 0
+                ? Float64(first.mDataByteSize) / Float64(Int(first.mNumberChannels) * MemoryLayout<Float>.size) : 0
+            self.trackTimeline(outputTime, frames: frames)
+            self.trackInputTimeline(inputTime, frames: frames)
             self.render(input: input, output: output)
         }
         guard procStatus == noErr, let proc else { throw FanOutError.status("AudioDeviceCreateIOProcIDWithBlock", procStatus) }
@@ -291,20 +297,19 @@ final class FanOut {
     }
 
     /// IO thread. Each cycle's output should start exactly where the previous one ended.
-    private func trackTimeline(_ time: UnsafePointer<AudioTimeStamp>, frames byteSize: UInt32) {
+    private func trackTimeline(_ time: UnsafePointer<AudioTimeStamp>, frames: Float64) {
         guard time.pointee.mFlags.contains(.sampleTimeValid) else { return }
         let start = time.pointee.mSampleTime
         if expectedOutputSampleTime >= 0, abs(start - expectedOutputSampleTime) > 0.5 { discontinuities &+= 1 }
-        let frames = Float64(byteSize) / Float64(2 * MemoryLayout<Float>.size)
         expectedOutputSampleTime = start + frames
     }
 
     /// IO thread. Same check for the tap side.
-    private func trackInputTimeline(_ time: UnsafePointer<AudioTimeStamp>, frames byteSize: UInt32) {
+    private func trackInputTimeline(_ time: UnsafePointer<AudioTimeStamp>, frames: Float64) {
         guard time.pointee.mFlags.contains(.sampleTimeValid) else { return }
         let start = time.pointee.mSampleTime
         if expectedInputSampleTime >= 0, abs(start - expectedInputSampleTime) > 0.5 { inputDiscontinuities &+= 1 }
-        expectedInputSampleTime = start + Float64(byteSize) / Float64(2 * MemoryLayout<Float>.size)
+        expectedInputSampleTime = start + frames
     }
 
     // MARK: Routing controls (any thread; the IO thread picks the values up on its next cycle)
@@ -314,6 +319,16 @@ final class FanOut {
         guard index >= 0, index < displays.count else { return }
         storedModes[index] = mode
         modeTable[index] = mode.effective(displayCount: displays.count).rawValue
+    }
+
+    /// Replace every routing setting at once. Call on the listener queue.
+    func apply(modes: [ChannelMode], trims newTrims: [Float], balance: Float) {
+        for index in 0..<displays.count {
+            if index < modes.count { setMode(modes[index], forDisplayAt: index) }
+            if index < newTrims.count, index < trims.count { trims[index] = newTrims[index] }
+        }
+        setBalance(balance)
+        mirrorControls()
     }
 
     /// Call on the listener queue.
@@ -450,7 +465,16 @@ final class FanOut {
     func mirrorControls() {
         let count = displays.count
         let mainDB = outputDecibels(of: mainDisplay)
-        if let mainDB {
+        let mainScalar = volumeElements(of: mainDisplay).first.flatMap { mainDisplay.id.outputVolume(element: $0) }
+        if let mainScalar, mainScalar <= 0 {
+            // Volume all the way down means silence everywhere, whatever the trims say.
+            for display in displays.dropFirst() {
+                for element in volumeElements(of: display) {
+                    display.id.setAudioValue(address(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput, element: element), Float32(0))
+                }
+            }
+            for index in 0..<count { gainTable[index] = 1 }
+        } else if let mainDB {
             var residual = [Float](repeating: 0, count: count)
             for index in 1..<max(count, 1) {
                 let display = displays[index]

@@ -47,12 +47,16 @@ enum Placement {
 
     /// Serials ordered left to right. Manual choice first; otherwise screen arrangement; otherwise input order.
     static func leftToRight(_ serials: [String]) -> [String] {
+        let byArrangement: [String] = {
+            let positioned = serials.map { ($0, ScreenMatch.midX(forSerial: $0)) }
+            guard positioned.allSatisfy({ $0.1 != nil }) else { return serials }
+            return positioned.sorted { $0.1! < $1.1! }.map(\.0)
+        }()
+        // The pinned display goes first; the rest keep their on-screen order.
         if let left = manualLeftSerial, serials.contains(left) {
-            return [left] + serials.filter { $0 != left }
+            return [left] + byArrangement.filter { $0 != left }
         }
-        let positioned = serials.map { ($0, ScreenMatch.midX(forSerial: $0)) }
-        guard positioned.allSatisfy({ $0.1 != nil }) else { return serials }
-        return positioned.sorted { $0.1! < $1.1! }.map(\.0)
+        return byArrangement
     }
 
     static var isAutomatic: Bool { manualLeftSerial == nil }
