@@ -114,7 +114,8 @@ final class Coordinator {
                     : position == 0 ? .left : position == ordered.count - 1 ? .right : .unknown
                 return DisplaySummary(
                     uid: device.uid, serial: device.serial, label: device.label,
-                    mode: index.map { fanOut!.mode(forDisplayAt: $0) } ?? ChannelMode.load(for: device.uid),
+                    mode: (index.map { fanOut!.mode(forDisplayAt: $0) } ?? ChannelMode.load(for: device.uid))
+                        .effective(displayCount: devices.count),
                     trim: LevelTrim.load(for: device.uid),
                     isMain: index == 0, side: side)
             }
@@ -325,7 +326,11 @@ final class Coordinator {
         let modes = ordered.map { ChannelMode.load(for: $0.uid) }
         let trims = ordered.map { LevelTrim.load(for: $0.uid) }
         let candidate = FanOut(mainDisplay: main, otherDisplays: others, modes: modes, trims: trims, balance: balance, listenerQueue: queue)
-        let routing = zip(ordered, zip(modes, trims)).map { "\($0.label) [\($0.id)] -> \($1.0.shortTitle), trim \(LevelTrim.describe($1.1))" }.joined(separator: ", ")
+        let routing = zip(ordered, zip(modes, trims)).map { display, settings in
+            let played = settings.0.effective(displayCount: ordered.count)
+            let note = played == settings.0 ? "" : " (saved: \(settings.0.shortTitle); one display, so both channels)"
+            return "\(display.label) [\(display.id)] -> \(played.shortTitle)\(note), trim \(LevelTrim.describe(settings.1))"
+        }.joined(separator: ", ")
         startGeneration += 1
         let generation = startGeneration
         starting = candidate

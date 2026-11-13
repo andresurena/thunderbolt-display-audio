@@ -198,6 +198,13 @@ enum ChannelMode: Int32, CaseIterable {
         }
     }
 
+    /// What a display actually plays. With a single display there is no second screen to carry the
+    /// other channel, so "left only" and "right only" play as stereo; the saved choice is kept for
+    /// when the second display comes back.
+    func effective(displayCount: Int) -> ChannelMode {
+        displayCount < 2 && (self == .leftOnly || self == .rightOnly) ? .stereo : self
+    }
+
     private static func key(_ uid: String) -> String { "channelMode." + uid }
 
     static func load(for uid: String) -> ChannelMode {

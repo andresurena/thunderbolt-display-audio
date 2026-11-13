@@ -33,7 +33,7 @@ You need macOS 14.2 (Sonoma) or later and two Apple Thunderbolt Displays connect
 
 1. Unzip the download and drag **Thunderbolt Displays Audio** into your Applications folder, then open it.
 2. **macOS will say it can't check the app for malware.** This happens because the app is signed with a developer certificate but not yet notarised by Apple. To allow it, open **System Settings › Privacy & Security**, scroll down, click **Open Anyway** next to "Thunderbolt Displays Audio", and confirm. You only do this once.
-3. When macOS asks whether the app may **record system audio**, click **Allow**.
+3. When macOS asks whether the app may **record system audio**, click **Allow**. The app can't copy sound to the second display without it. If you clicked Don't Allow by mistake, switch it on in **System Settings › Privacy & Security › Screen & System Audio Recording**, then quit and reopen the app.
 4. A small two-screens icon appears in the menu bar. Choose one of your displays ("Display Audio") as the sound output in the menu bar's sound menu, or click **Use Thunderbolt Displays as Output** in the app's menu.
 5. In the app's menu, tick **Open at Login** so it starts with your Mac.
 
@@ -46,6 +46,13 @@ Everything lives in the menu bar icon:
 - **One Display per Channel** sends the left channel to your left display and the right channel to your right one. **Swap Left and Right** flips them.
 - **Balance** shifts the sound towards one side.
 - Your choices are remembered, even if you unplug a display.
+
+## Turning it off or removing it
+
+- **Stop it for now:** click the menu bar icon and choose **Quit**. Open it again from Applications whenever you want.
+- **Stop it opening when your Mac starts:** untick **Open at Login** in the app's menu.
+- **Remove it completely:** untick **Open at Login**, quit the app, then drag it from Applications to the Bin.
+- **Down to one display?** The app keeps working and plays both channels through the display you have left. Your left and right choices come back when the second display does. With a single display you don't need the app at all, so you can also just quit it.
 
 ---
 
@@ -79,16 +86,26 @@ apps ──▶ Display Audio #1 (the Mac's output device; volume keys drive it n
 - Startup of the tap runs off the main work queue. If macOS is waiting on the permission prompt (it can't show one while the screen is locked), the menu says so instead of freezing.
 - The app rebuilds its routing when displays are plugged in or removed, when the output device changes, and when Core Audio restarts.
 - Only one copy can run at a time.
+- Quit always quits: if Core Audio stalls, the app stops waiting for its teardown after three seconds and exits. Core Audio removes the app's private devices itself when the process ends.
+- With a single display connected, "left only" and "right only" play as stereo, so a saved split can never leave you with half the sound. The saved choice is kept for when the second display returns.
+- **Open at Login** works for both kinds of install: it removes the install script's LaunchAgent or the system login item, whichever is in use, and turns the system login item on.
 
 ### Build from source
 
 Requires Xcode command line tools (Swift 6 toolchain, Swift 5 language mode).
 
 ```bash
-scripts/build.sh       # Build/Thunderbolt Displays Audio.app
-scripts/install.sh     # copies it to /Applications, adds a login item (LaunchAgent), starts it
-scripts/uninstall.sh
-scripts/make-icon.sh   # regenerates Helper/AppIcon.icns from Tools/MakeIcon.swift
+scripts/build.sh                 # Build/Thunderbolt Displays Audio.app
+scripts/install.sh               # copies it to /Applications, adds a login item (LaunchAgent), starts it
+scripts/install.sh --no-login    # same, but leaves Open at Login off
+scripts/uninstall.sh             # removes the app and any login item
+scripts/make-icon.sh             # regenerates Helper/AppIcon.icns from Tools/MakeIcon.swift
+```
+
+Open at Login can also be read or changed without opening the app:
+
+```bash
+"/Applications/Thunderbolt Displays Audio.app/Contents/MacOS/ThunderboltDisplaysHelper" --login-item status   # or: on | off
 ```
 
 The build signs with your first "Apple Development" identity if one exists, otherwise ad hoc; set `SIGN_IDENTITY` to override. `install.sh` needs no password on an admin account. It waits for launchd to finish unloading a previous copy and fails loudly if the app doesn't start. Quit from the menu stops the app until next login; launchd only restarts it after a crash.
@@ -103,6 +120,7 @@ Upgrading from the first, plugin-based version: `scripts/remove-legacy-plugin.sh
 | `Helper/Coordinator.swift` | Watches devices and the output, starts and rebuilds the routing |
 | `Helper/Screens.swift` | Matching displays to screens, placement, the red outline |
 | `Helper/TestTone.swift` | The identify beeps |
+| `Helper/LoginItem.swift` | Open at Login, for both kinds of install |
 | `Helper/main.swift` | The menu bar menu |
 | `Tools/MakeIcon.swift` | Draws the app icon |
 

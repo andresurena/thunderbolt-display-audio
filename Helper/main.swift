@@ -1,5 +1,4 @@
 import AppKit
-import ServiceManagement
 
 /// Menu row holding the left/right balance slider.
 final class BalanceView: NSView {
@@ -70,8 +69,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         coordinator.start()
     }
 
+    /// Tear the routing down, but never let a stalled Core Audio keep Quit from quitting: its calls can
+    /// block for a minute or more. If the teardown is cut short, coreaudiod removes the private
+    /// aggregate and the tap itself when this process exits.
     func applicationWillTerminate(_ notification: Notification) {
-        coordinator.stop()
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async { [coordinator] in
+            coordinator.stop()
+            done.signal()
+        }
+        if done.wait(timeout: .now() + 3) == .timedOut {
+            log("Quit: Core Audio did not answer within 3 s; exiting without waiting for the teardown")
+            Thread.sleep(forTimeInterval: 0.1)   // let the log line reach the file
+        }
     }
 
     // The menu is rebuilt every time it opens, so it always reflects the current displays and modes.
@@ -99,7 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if display.trim != 0 { title += " · \(LevelTrim.describe(display.trim))" }
                 if display.isMain { title += " (volume keys)" }
                 let entry = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-                entry.submenu = submenu(for: display, active: snapshot.isActive)
+                entry.submenu = submenu(for: display, active: snapshot.isActive, solo: snapshot.displays.count < 2)
                 menu.addItem(entry)
             }
             menu.addItem(action("Identify Displays", #selector(identifyAll)))
@@ -145,7 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(action("Quit Thunderbolt Displays Audio", #selector(quit), key: "q"))
     }
 
-    private func submenu(for display: DisplaySummary, active: Bool) -> NSMenu {
+    private func submenu(for display: DisplaySummary, active: Bool, solo: Bool) -> NSMenu {
         let sub = NSMenu()
         sub.autoenablesItems = false
         for mode in ChannelMode.allCases {
@@ -153,8 +163,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.tag = Int(mode.rawValue)
             item.representedObject = display.uid
             item.state = mode == display.mode ? .on : .off
-            item.isEnabled = active
+            // One channel per display needs a second display to carry the other channel.
+            item.isEnabled = active && (!solo || mode == .stereo || mode == .mono)
             sub.addItem(item)
+        }
+        if solo {
+            let note = NSMenuItem(title: "Left / right only need two displays", action: nil, keyEquivalent: "")
+            note.isEnabled = false
+            sub.addItem(note)
         }
         sub.addItem(.separator())
 
@@ -286,41 +302,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Open at Login
 
-    /// The install script starts the app with its own LaunchAgent; a downloaded copy uses the
-    /// system's login item list instead. Never both, so the app cannot run twice.
-    private var installedByScript: Bool {
-        FileManager.default.fileExists(atPath: FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/LaunchAgents/com.andresurena.ThunderboltDisplays.helper.plist").path)
-    }
-
     private func loginItem() -> NSMenuItem {
-        if installedByScript {
-            let item = NSMenuItem(title: "Opens at Login (set up by the install script)", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            item.state = .on
-            return item
-        }
         let item = action("Open at Login", #selector(toggleLogin))
-        item.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        item.state = LoginItem.isOn ? .on : .off
         return item
     }
 
     @objc private func toggleLogin() {
+        let turnOn = !LoginItem.isOn
         do {
-            if SMAppService.mainApp.status == .enabled {
-                try SMAppService.mainApp.unregister()
-                log("Open at Login: off")
-            } else {
-                try SMAppService.mainApp.register()
-                log("Open at Login: on")
-            }
+            try LoginItem.set(turnOn)
+            log("Open at Login: \(turnOn ? "on" : "off")")
         } catch {
             log("Open at Login change failed: \(error)")
             let alert = NSAlert()
             alert.messageText = "Couldn't change Open at Login"
-            alert.informativeText = "\(error.localizedDescription)\n\nYou can add the app in System Settings › General › Login Items."
+            alert.informativeText = "\(error.localizedDescription)\n\nYou can change it in System Settings › General › Login Items & Extensions."
             alert.runModal()
         }
+    }
+}
+
+// `--login-item on|off|status`: change or report Open at Login without opening the app (used by the scripts).
+if let flag = CommandLine.arguments.firstIndex(of: "--login-item") {
+    let value = flag + 1 < CommandLine.arguments.count ? CommandLine.arguments[flag + 1] : "status"
+    do {
+        switch value {
+        case "on": try LoginItem.set(true)
+        case "off": try LoginItem.set(false)
+        case "status": break
+        default:
+            FileHandle.standardError.write(Data("usage: --login-item on|off|status\n".utf8))
+            exit(2)
+        }
+        print("Open at Login: \(LoginItem.isOn ? "on" : "off")")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("Could not change Open at Login: \(error.localizedDescription)\n".utf8))
+        exit(1)
     }
 }
 

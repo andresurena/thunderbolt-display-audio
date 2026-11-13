@@ -37,8 +37,10 @@ final class FanOut {
     private static let maxDisplays = 16
     /// Output buffer index -> display index, or -1 for anything unexpected (silenced).
     private let outputBufferDisplay = UnsafeMutablePointer<Int32>.allocate(capacity: FanOut.maxOutputBuffers)
-    /// Display index -> ChannelMode raw value.
+    /// Display index -> raw value of the ChannelMode actually played (see ChannelMode.effective).
     private let modeTable = UnsafeMutablePointer<Int32>.allocate(capacity: FanOut.maxDisplays)
+    /// Display index -> the mode the user chose (control side only).
+    private var storedModes: [ChannelMode] = []
     /// Display index -> linear software gain (<= 1). Only below 1 when a level trim needs more boost
     /// than a display's hardware volume can give: the other displays are attenuated instead.
     private let gainTable = UnsafeMutablePointer<Float>.allocate(capacity: FanOut.maxDisplays)
@@ -80,7 +82,8 @@ final class FanOut {
         outputBufferDisplay.initialize(repeating: -1, count: FanOut.maxOutputBuffers)
         gainTable.initialize(repeating: 1, count: FanOut.maxDisplays)
         modeTable.initialize(repeating: ChannelMode.stereo.rawValue, count: FanOut.maxDisplays)
-        for (index, mode) in modes.prefix(FanOut.maxDisplays).enumerated() { modeTable[index] = mode.rawValue }
+        storedModes = (0..<self.displays.count).map { $0 < modes.count ? modes[$0] : .stereo }
+        for (index, mode) in storedModes.enumerated() { modeTable[index] = mode.effective(displayCount: self.displays.count).rawValue }
         setBalance(balance)
     }
 
@@ -306,9 +309,11 @@ final class FanOut {
 
     // MARK: Routing controls (any thread; the IO thread picks the values up on its next cycle)
 
+    /// Call on the listener queue.
     func setMode(_ mode: ChannelMode, forDisplayAt index: Int) {
         guard index >= 0, index < displays.count else { return }
-        modeTable[index] = mode.rawValue
+        storedModes[index] = mode
+        modeTable[index] = mode.effective(displayCount: displays.count).rawValue
     }
 
     /// Call on the listener queue.
@@ -318,9 +323,10 @@ final class FanOut {
         mirrorControls()
     }
 
+    /// The mode the user chose. Call on the listener queue.
     func mode(forDisplayAt index: Int) -> ChannelMode {
-        guard index >= 0, index < displays.count else { return .stereo }
-        return ChannelMode(rawValue: modeTable[index]) ?? .stereo
+        guard index >= 0, index < storedModes.count else { return .stereo }
+        return storedModes[index]
     }
 
     /// -1 = fully left, 0 = centre, 1 = fully right. Like the classic macOS slider: the side you move
